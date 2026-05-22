@@ -580,8 +580,28 @@ def render_playlist_cards(pls_view: list[dict]):
             )
 
 
+PLATFORM_SCOPE_OPTIONS = [
+    "Importantes (4)",
+    "Todas (9)",
+    "spotify",
+    "apple-music",
+    "amazon",
+    "deezer",
+    "youtube",
+    "soundcloud",
+    "tidal",
+    "audiomack",
+    "pandora",
+]
+
+
 def _platforms_for_scope(scope: str) -> list[str]:
-    return PLATFORMS_DEFAULT if scope.startswith("Importantes") else PLATFORMS_DEFAULT + PLATFORMS_EXTRA
+    if scope.startswith("Importantes"):
+        return PLATFORMS_DEFAULT
+    if scope.startswith("Todas"):
+        return PLATFORMS_DEFAULT + PLATFORMS_EXTRA
+    # Caso individual: el propio nombre es el platform code
+    return [scope]
 
 
 def tab_individual():
@@ -591,7 +611,7 @@ def tab_individual():
         isrc_input = st.text_input("ISRC", placeholder="ej. ES14H2600001",
                                     label_visibility="collapsed")
     with col_plat:
-        scope = st.selectbox("Plataformas", ["Importantes (4)", "Todas (9)"],
+        scope = st.selectbox("Plataformas", PLATFORM_SCOPE_OPTIONS,
                               label_visibility="collapsed", key="indiv_scope")
     with col_refresh:
         if st.button("🔄 Refrescar", width="stretch",
@@ -705,7 +725,7 @@ def tab_batch():
         uploaded = st.file_uploader("Excel con ISRCs", type=["xlsx", "xls", "csv"],
                                      key="batch_upload", label_visibility="collapsed")
     with col_plat:
-        scope = st.selectbox("Plataformas", ["Importantes (4)", "Todas (9)"],
+        scope = st.selectbox("Plataformas", PLATFORM_SCOPE_OPTIONS,
                               key="batch_scope", label_visibility="collapsed")
 
     if not uploaded:
@@ -827,13 +847,48 @@ def show_batch_result():
         width="stretch", hide_index=True, height=500,
     )
 
-    csv = df_view.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "📥 Descargar CSV",
-        data=csv,
-        file_name=f"placements_batch_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-        mime="text/csv",
-    )
+    # Descargas: CSV + PDF
+    col_dl1, col_dl2 = st.columns(2)
+    with col_dl1:
+        csv = df_view.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "📥 Descargar CSV (todos los placements, sin filtrar)",
+            data=csv,
+            file_name=f"placements_batch_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+    with col_dl2:
+        # PDF: solo editoriales, agrupado por canción
+        pdf_btn = st.button(
+            "📄 Generar PDF (solo editoriales)",
+            help="Genera reporte PDF con logo Musicadders, agrupado por canción, "
+                 "incluyendo portada de cada playlist. Tarda 10-30s si hay muchas playlists.",
+            width="stretch",
+        )
+
+    if pdf_btn:
+        try:
+            from pdf_report import generate_pdf
+        except Exception as e:
+            st.error(f"Error cargando módulo PDF: {e}")
+            return
+        with st.spinner("Generando PDF (descargando portadas)…"):
+            try:
+                pdf_bytes = generate_pdf(pls, res.get("meta") or {})
+            except Exception as e:
+                st.error(f"Error generando PDF: {e}")
+                return
+        st.session_state.last_pdf = pdf_bytes
+
+    if st.session_state.get("last_pdf"):
+        st.download_button(
+            "⬇️ Descargar PDF generado",
+            data=st.session_state.last_pdf,
+            file_name=f"placements_editoriales_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+            mime="application/pdf",
+            width="stretch",
+        )
 
     st.info(
         "💡 Si quieres crear una playlist en Spotify con estos ISRCs, ve a la "
