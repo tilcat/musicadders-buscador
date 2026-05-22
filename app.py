@@ -745,22 +745,23 @@ def tab_batch():
             f"({consumed} + {est_calls} > {max_per_day}). Se cortará a mitad."
         )
 
-    if not st.button("🚀 Procesar batch", type="primary"):
-        return
+    if st.button("🚀 Procesar batch", type="primary"):
+        buster = st.session_state.get("cache_buster", "")
+        prog = st.progress(0.0, text="Empezando…")
+        def _cb(i, total, isrc):
+            prog.progress(i / max(total, 1), text=f"{i}/{total} — {isrc}")
+        res = batch_search(isrcs, platforms, buster=buster, progress_cb=_cb)
+        prog.empty()
+        st.session_state.calls_today = consumed + res["calls_used"]
+        st.session_state.batch_result = res
+        st.session_state.batch_isrcs = isrcs
+        st.success(f"✅ Procesado: {len(res['meta'])} ISRCs resueltos, "
+                   f"{len(res['playlists'])} placements, {res['calls_used']} llamadas API.")
 
-    # Procesar
-    buster = st.session_state.get("cache_buster", "")
-    prog = st.progress(0.0, text="Empezando…")
-    def _cb(i, total, isrc):
-        prog.progress(i / max(total, 1), text=f"{i}/{total} — {isrc}")
-    t0 = time.time()
-    res = batch_search(isrcs, platforms, buster=buster, progress_cb=_cb)
-    prog.empty()
-    st.session_state.calls_today = consumed + res["calls_used"]
-    st.session_state.batch_result = res
-    st.session_state.batch_isrcs = isrcs
-
-    show_batch_result()
+    # Si hay un resultado guardado (de este procesado o de uno previo), mostrarlo
+    if st.session_state.get("batch_result"):
+        st.divider()
+        show_batch_result()
 
 
 def show_batch_result():
@@ -1018,10 +1019,6 @@ def main_view():
         tab_individual()
     with tab2:
         tab_batch()
-        # Si ya hay resultado de batch, mostrarlo (sobrevive a reruns)
-        if st.session_state.get("batch_result") and not st.session_state.get("_batch_just_processed"):
-            with st.expander("📋 Resultados del último batch procesado", expanded=False):
-                show_batch_result()
     with tab3:
         tab_playlist()
 
