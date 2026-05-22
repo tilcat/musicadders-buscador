@@ -914,17 +914,17 @@ def tab_playlist():
         st.markdown(
             "Para crear playlists necesitas conectar tu cuenta Spotify (1 sola vez):"
         )
-        st.markdown(
-            f"<a href='{url}' target='_self' "
-            f"style='display:inline-block;padding:0.8rem 2rem;background:#1ED760;"
-            f"color:white;text-decoration:none;border-radius:50px;font-weight:600;'>"
-            f"🎵 Conectar mi cuenta Spotify</a>",
-            unsafe_allow_html=True,
-        )
+        # st.link_button abre en la misma pestaña (preferible para OAuth):
+        # mantiene la sesión y al volver con ?code= se procesa automáticamente.
+        st.link_button("🎵 Conectar mi cuenta Spotify", url, type="primary")
         st.caption(
-            "Se abrirá Spotify para que autorices la app a crear playlists en tu cuenta. "
-            "Al volver, esta página te mostrará confirmación."
+            "Te llevará a Spotify para autorizar. Tras autorizar volverás aquí y verás "
+            "confirmación. Si tu navegador tiene bloqueador (uBlock, Brave Shields, "
+            "AdBlock…) que bloquea accounts.spotify.com, **whitelistéalo** o usa "
+            "modo incógnito **abriendo esta URL ahí**: " + (st.secrets.get("APP_BASE_URL", "") or "")
         )
+        with st.expander("¿No se abre? Copia este link y pégalo en el navegador"):
+            st.code(url, language=None)
         return
 
     # Ya conectado
