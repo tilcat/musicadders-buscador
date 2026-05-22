@@ -1,30 +1,32 @@
 """Buscador ISRC público — Musicadders.
 
-App pequeña standalone Streamlit Cloud para que cualquier trabajador de
-Musicadders pueda pegar un ISRC y ver en qué playlists está, en todas las
-DSPs que cubre Soundcharts.
-
-Características:
-  - Multi-usuario con bcrypt (lista en st.secrets["users"]).
-  - Modo LIVE puro: cada búsqueda llama Soundcharts API directamente.
-  - Cache en memoria de sesión (st.cache_data) para no duplicar llamadas.
-  - Kill-switch diario configurable.
-  - Branding Musicadders (gradient verde-cian + logo).
-  - Sin BD persistente — funciona en Streamlit Cloud sin volumen.
+3 modos:
+  1. Búsqueda individual: pega 1 ISRC → placements en vivo.
+  2. Procesado batch: sube Excel con hasta 500 ISRCs → tabla unificada.
+  3. Crear playlist Spotify: cada usuario conecta su Spotify (OAuth) y
+     crea playlist con los ISRCs encontrados.
 
 Variables de entorno necesarias (Streamlit Cloud Secrets UI):
     SOUNDCHARTS_APP_ID = "..."
     SOUNDCHARTS_API_KEY = "..."
     SOUNDCHARTS_MAX_PER_DAY = "5000"   # opcional
+    SPOTIFY_CLIENT_ID = "..."          # solo si quieren crear playlists
+    SPOTIFY_CLIENT_SECRET = "..."
+    APP_BASE_URL = "https://musicadders-isrc.streamlit.app"  # exacto sin trailing slash
+
     [users]
-    "victor@musicadders.com" = "$2b$12$..."   # bcrypt hash
-    "ana@musicadders.com"    = "$2b$12$..."
+    "victor@musicadders.com" = "$2b$12$..."
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import io
 import os
 import re
+import secrets as _secrets_mod
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,6 +34,13 @@ import bcrypt
 import pandas as pd
 import requests
 import streamlit as st
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# CONSTANTES
+# ════════════════════════════════════════════════════════════════════════════
+MAX_BATCH_ISRCS = 500
+SPOTIFY_SCOPES = "playlist-modify-public playlist-modify-private user-read-private"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -293,84 +302,326 @@ def search_isrc(isrc: str, platforms: list[str], buster: str = "") -> dict:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# SPOTIFY OAUTH POR USUARIO
+# ════════════════════════════════════════════════════════════════════════════
+SP_TOKEN_URL = "https://accounts.spotify.com/api/token"
+SP_AUTH_URL = "https://accounts.spotify.com/authorize"
+SP_API = "https://api.spotify.com/v1"
+
+
+def _app_base_url() -> str:
+    """Base URL exacta de la app (para construir el redirect URI Spotify)."""
+    return str(st.secrets.get("APP_BASE_URL", "https://musicadders-isrc.streamlit.app")).rstrip("/")
+
+
+def spotify_login_url() -> str | None:
+    """Genera la URL de autorización Spotify para el user actual."""
+    cid = st.secrets.get("SPOTIFY_CLIENT_ID", "").strip()
+    if not cid:
+        return None
+    state = _secrets_mod.token_urlsafe(16)
+    st.session_state.spotify_oauth_state = state
+    params = {
+        "client_id": cid,
+        "response_type": "code",
+        "redirect_uri": _app_base_url() + "/",
+        "scope": SPOTIFY_SCOPES,
+        "state": state,
+        "show_dialog": "true",
+    }
+    return f"{SP_AUTH_URL}?{urllib.parse.urlencode(params)}"
+
+
+def spotify_exchange_code(code: str) -> dict | None:
+    """Intercambia el ?code= por access_token + refresh_token."""
+    cid = st.secrets.get("SPOTIFY_CLIENT_ID", "").strip()
+    cs = st.secrets.get("SPOTIFY_CLIENT_SECRET", "").strip()
+    if not (cid and cs):
+        return None
+    auth = base64.b64encode(f"{cid}:{cs}".encode()).decode()
+    r = requests.post(
+        SP_TOKEN_URL,
+        headers={"Authorization": f"Basic {auth}",
+                 "Content-Type": "application/x-www-form-urlencoded"},
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": _app_base_url() + "/",
+        },
+        timeout=20,
+    )
+    if r.status_code != 200:
+        return None
+    return r.json()
+
+
+def spotify_refresh_access_token() -> str | None:
+    """Renueva el access_token del user actual usando su refresh_token."""
+    rt = st.session_state.get("spotify_refresh_token")
+    if not rt:
+        return None
+    cid = st.secrets.get("SPOTIFY_CLIENT_ID", "").strip()
+    cs = st.secrets.get("SPOTIFY_CLIENT_SECRET", "").strip()
+    auth = base64.b64encode(f"{cid}:{cs}".encode()).decode()
+    r = requests.post(
+        SP_TOKEN_URL,
+        headers={"Authorization": f"Basic {auth}",
+                 "Content-Type": "application/x-www-form-urlencoded"},
+        data={"grant_type": "refresh_token", "refresh_token": rt},
+        timeout=15,
+    )
+    if r.status_code != 200:
+        return None
+    d = r.json()
+    st.session_state.spotify_access_token = d["access_token"]
+    st.session_state.spotify_token_expires = time.time() + int(d.get("expires_in", 3600))
+    return d["access_token"]
+
+
+def spotify_get_token() -> str | None:
+    """Devuelve un access_token válido del user actual, renovando si caducó."""
+    at = st.session_state.get("spotify_access_token")
+    exp = st.session_state.get("spotify_token_expires", 0)
+    if at and time.time() < exp - 60:
+        return at
+    return spotify_refresh_access_token()
+
+
+def spotify_user_id() -> str | None:
+    if st.session_state.get("spotify_user_id"):
+        return st.session_state.spotify_user_id
+    tok = spotify_get_token()
+    if not tok:
+        return None
+    r = requests.get(f"{SP_API}/me", headers={"Authorization": f"Bearer {tok}"}, timeout=15)
+    if r.status_code != 200:
+        return None
+    me = r.json()
+    st.session_state.spotify_user_id = me.get("id")
+    st.session_state.spotify_display_name = me.get("display_name") or me.get("id")
+    return st.session_state.spotify_user_id
+
+
+def spotify_find_uri_by_isrc(isrc: str) -> str | None:
+    tok = spotify_get_token()
+    if not tok:
+        return None
+    r = requests.get(
+        f"{SP_API}/search",
+        headers={"Authorization": f"Bearer {tok}"},
+        params={"q": f"isrc:{isrc}", "type": "track", "limit": 1},
+        timeout=15,
+    )
+    if r.status_code != 200:
+        return None
+    items = (r.json().get("tracks") or {}).get("items") or []
+    return items[0]["uri"] if items else None
+
+
+def spotify_create_playlist(name: str, description: str = "", public: bool = False) -> dict | None:
+    tok = spotify_get_token()
+    uid = spotify_user_id()
+    if not (tok and uid):
+        return None
+    r = requests.post(
+        f"{SP_API}/users/{uid}/playlists",
+        headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"},
+        json={"name": name, "description": description, "public": bool(public)},
+        timeout=15,
+    )
+    if r.status_code != 201:
+        return None
+    return r.json()
+
+
+def spotify_add_tracks(playlist_id: str, uris: list[str]) -> int:
+    tok = spotify_get_token()
+    if not tok:
+        return 0
+    added = 0
+    for i in range(0, len(uris), 100):
+        chunk = uris[i:i+100]
+        r = requests.post(
+            f"{SP_API}/playlists/{playlist_id}/tracks",
+            headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"},
+            json={"uris": chunk},
+            timeout=20,
+        )
+        if r.status_code in (200, 201):
+            added += len(chunk)
+    return added
+
+
+def handle_spotify_callback():
+    """Si la URL trae ?code=...&state=..., intercambia y guarda el refresh_token.
+    Limpia los query params después para que el reload no re-intercambie."""
+    qp = st.query_params
+    code = qp.get("code")
+    state = qp.get("state")
+    if not code:
+        return
+    expected_state = st.session_state.get("spotify_oauth_state")
+    if expected_state and state != expected_state:
+        st.error("OAuth Spotify: state mismatch — vuelve a conectar.")
+        st.query_params.clear()
+        return
+    data = spotify_exchange_code(code)
+    if data:
+        st.session_state.spotify_refresh_token = data.get("refresh_token")
+        st.session_state.spotify_access_token = data["access_token"]
+        st.session_state.spotify_token_expires = time.time() + int(data.get("expires_in", 3600))
+        st.success("✅ Spotify conectado correctamente.")
+    else:
+        st.error("No se pudo intercambiar el code Spotify. Revisa CLIENT_ID/SECRET en Secrets.")
+    st.query_params.clear()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# BATCH SEARCH
+# ════════════════════════════════════════════════════════════════════════════
+def parse_isrcs_from_excel(file) -> list[str]:
+    """Lee xlsx/csv y devuelve lista de ISRCs únicos, validados."""
+    name = (file.name or "").lower()
+    if name.endswith(".csv"):
+        df = pd.read_csv(file)
+    else:
+        df = pd.read_excel(file)
+    isrc_col = None
+    for c in df.columns:
+        cn = str(c).strip().lower().replace(" ", "").replace("_", "")
+        if cn in ("isrc", "filtrarisrc"):
+            isrc_col = c
+            break
+    if not isrc_col:
+        raise ValueError(
+            f"No encontré columna ISRC. Columnas: {', '.join(str(c) for c in df.columns)}. "
+            "Renombra una a 'ISRC' y vuelve a subir."
+        )
+    isrcs_raw = df[isrc_col].astype(str).str.strip().str.upper()
+    isrcs = sorted({i for i in isrcs_raw
+                    if re.fullmatch(r"[A-Z]{2}[A-Z0-9]{3}\d{7}", i)})
+    return isrcs
+
+
+def batch_search(isrcs: list[str], platforms: list[str], buster: str = "",
+                 progress_cb=None) -> dict:
+    """Procesa una lista de ISRCs. Devuelve dict con resumen + playlists agregadas."""
+    out_meta = {}
+    all_pls = []
+    calls = 0
+    not_found = []
+    for i, isrc in enumerate(isrcs):
+        if progress_cb:
+            progress_cb(i + 1, len(isrcs), isrc)
+        try:
+            res = search_isrc(isrc, platforms, buster=buster)
+        except Exception as e:
+            not_found.append((isrc, f"error: {str(e)[:80]}"))
+            continue
+        calls += res.get("calls_used", 0)
+        if not res.get("meta"):
+            not_found.append((isrc, "no en Soundcharts"))
+            continue
+        out_meta[isrc] = res["meta"]
+        for p in res.get("playlists", []):
+            p2 = dict(p)
+            p2["isrc"] = isrc
+            p2["song_name"] = res["meta"].get("song_name") or ""
+            p2["credit_name"] = res["meta"].get("credit_name") or ""
+            all_pls.append(p2)
+    return {
+        "meta": out_meta,
+        "playlists": all_pls,
+        "calls_used": calls,
+        "not_found": not_found,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # UI principal
 # ════════════════════════════════════════════════════════════════════════════
-def main_view():
-    user = st.session_state.user_email
+def render_playlist_cards(pls_view: list[dict]):
+    """Renderiza las cards agrupadas por plataforma."""
+    by_plat: dict[str, list[dict]] = {}
+    for p in pls_view:
+        by_plat.setdefault(p["platform"], []).append(p)
+    PLAT_ICONS = {
+        "spotify": "🎧", "apple-music": "🍎", "amazon": "🛒", "deezer": "🎵",
+        "youtube": "📺", "soundcloud": "☁️", "tidal": "🌊",
+        "audiomack": "🎶", "pandora": "📻",
+    }
+    for plat, items in by_plat.items():
+        icon = PLAT_ICONS.get(plat, "🎶")
+        st.markdown(f"#### {icon} {plat.title()} · {len(items)} playlists")
+        for p in items:
+            t = p.get("playlist_type") or ""
+            css_class = (
+                "algorithmic" if "algorithmic" in t.lower() or "algotorial" in t.lower() else
+                "charts" if "chart" in t.lower() else
+                "user" if t == "Curators & Listeners" else ""
+            )
+            subs = p.get("subscriber_count")
+            subs_fmt = f"{subs:,}" if subs and subs >= 1000 else (str(subs) if subs else "—")
+            pos = p.get("position") or "—"
+            countries = p.get("country_code") or ""
+            variantes = f" · {p['n_variantes']} variantes" if p.get("n_variantes", 1) > 1 else ""
+            entry = (p.get("entry_date") or "")[:10]
+            meta_line = (
+                f"{t} · pos #{pos} · {subs_fmt} subs · {countries or 'global'}"
+                f"{variantes}"
+                f"{' · entró ' + entry if entry else ''}"
+            )
+            st.markdown(
+                f"<div class='ma-pl-card {css_class}'>"
+                f"<div class='pl-name'>{p.get('playlist_name','?')}</div>"
+                f"<div class='pl-meta'>{meta_line}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
-    # Header
-    st.markdown(
-        f"""
-<div class='ma-header'>
-  <h1>🎵 Buscador de placements</h1>
-  <div class='sub'>Hola, <b>{user}</b> · pega un ISRC y mira en qué playlists está</div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
 
-    col_q, col_plat, col_refresh, col_logout = st.columns([4, 2, 1, 1])
+def _platforms_for_scope(scope: str) -> list[str]:
+    return PLATFORMS_DEFAULT if scope.startswith("Importantes") else PLATFORMS_DEFAULT + PLATFORMS_EXTRA
+
+
+def tab_individual():
+    """Tab 1 — búsqueda de un solo ISRC."""
+    col_q, col_plat, col_refresh = st.columns([4, 2, 1])
     with col_q:
-        isrc_input = st.text_input(
-            "ISRC", placeholder="ej. ES14H2600001",
-            label_visibility="collapsed",
-        )
+        isrc_input = st.text_input("ISRC", placeholder="ej. ES14H2600001",
+                                    label_visibility="collapsed")
     with col_plat:
-        scope = st.selectbox(
-            "Plataformas",
-            ["Importantes (4)", "Todas (9)"],
-            label_visibility="collapsed",
-        )
+        scope = st.selectbox("Plataformas", ["Importantes (4)", "Todas (9)"],
+                              label_visibility="collapsed", key="indiv_scope")
     with col_refresh:
         if st.button("🔄 Refrescar", width="stretch",
-                     help="Ignora la cache de 1h y vuelve a consultar Soundcharts ahora mismo."):
+                     help="Ignora cache y consulta Soundcharts ahora."):
             st.session_state.cache_buster = str(time.time())
             st.rerun()
-    with col_logout:
-        if st.button("Salir", width="stretch"):
-            for k in list(st.session_state.keys()):
-                del st.session_state[k]
-            st.rerun()
 
-    platforms = (PLATFORMS_DEFAULT if scope == "Importantes (4)"
-                 else PLATFORMS_DEFAULT + PLATFORMS_EXTRA)
-
-    # Validar ISRC
+    platforms = _platforms_for_scope(scope)
     isrc = (isrc_input or "").strip().upper()
     if not isrc:
-        st.info(
-            "👆 Pega un ISRC arriba. Formato típico: **ES** + 3 chars + 7 dígitos "
-            "(ej. `ES14H2600001`). Si no sabes el ISRC, búscalo en el reproductor "
-            "(Spotify → click derecho → 'Share' → 'Copy Song Link', luego en "
-            "https://kid.tools/spotify-isrc o similares)."
-        )
+        st.info("👆 Pega un ISRC arriba (formato 12 chars, ej. `ES14H2600001`).")
         return
     if not re.fullmatch(r"[A-Za-z]{2}[A-Za-z0-9]{3}\d{7}", isrc):
-        st.warning(
-            f"`{isrc}` no parece un ISRC válido. Formato esperado: 12 chars, "
-            f"2 letras + 3 chars + 7 dígitos."
-        )
+        st.warning(f"`{isrc}` no parece un ISRC válido.")
         return
 
-    # Kill-switch
     max_per_day = int(st.secrets.get("SOUNDCHARTS_MAX_PER_DAY", "5000"))
     if "calls_today" not in st.session_state:
         st.session_state.calls_today = 0
     if st.session_state.calls_today >= max_per_day:
-        st.error(
-            f"⚠️ Se ha alcanzado el límite de búsquedas del día ({max_per_day}). "
-            f"Vuelve mañana o contacta con A&R."
-        )
+        st.error(f"⚠️ Límite de búsquedas del día ({max_per_day}) alcanzado.")
         return
 
-    # Búsqueda — buster permite refresh manual sin tocar el cache global
     buster = st.session_state.get("cache_buster", "")
     t0 = time.time()
     with st.spinner(f"Buscando `{isrc}` en {len(platforms)} plataformas…"):
         try:
             res = search_isrc(isrc, platforms, buster=buster)
         except Exception as e:
-            st.error(f"Error consultando Soundcharts: {e}")
+            st.error(f"Error: {e}")
             return
     st.session_state.calls_today += res["calls_used"]
     ms = int((time.time() - t0) * 1000)
@@ -440,52 +691,339 @@ def main_view():
     if not pls_view:
         st.info("Ningún resultado con esos filtros.")
         return
+    render_playlist_cards(pls_view)
 
-    # Render cards por plataforma
-    by_plat: dict[str, list[dict]] = {}
-    for p in pls_view:
-        by_plat.setdefault(p["platform"], []).append(p)
 
-    PLAT_ICONS = {
-        "spotify": "🎧", "apple-music": "🍎", "amazon": "🛒", "deezer": "🎵",
-        "youtube": "📺", "soundcloud": "☁️", "tidal": "🌊",
-        "audiomack": "🎶", "pandora": "📻",
-    }
-    for plat, items in by_plat.items():
-        icon = PLAT_ICONS.get(plat, "🎶")
-        st.markdown(f"#### {icon} {plat.title()} · {len(items)} playlists")
-        for p in items:
-            t = p.get("playlist_type") or ""
-            css_class = (
-                "algorithmic" if "algorithmic" in t.lower() or "algotorial" in t.lower() else
-                "charts" if "chart" in t.lower() else
-                "user" if t == "Curators & Listeners" else
-                ""
+def tab_batch():
+    """Tab 2 — procesado batch de Excel con hasta 500 ISRCs."""
+    st.markdown(
+        "Sube un Excel/CSV con una columna **`ISRC`**. La app busca cada uno en "
+        "Soundcharts y te muestra una tabla unificada con todas las playlists."
+    )
+    col_up, col_plat = st.columns([3, 1])
+    with col_up:
+        uploaded = st.file_uploader("Excel con ISRCs", type=["xlsx", "xls", "csv"],
+                                     key="batch_upload", label_visibility="collapsed")
+    with col_plat:
+        scope = st.selectbox("Plataformas", ["Importantes (4)", "Todas (9)"],
+                              key="batch_scope", label_visibility="collapsed")
+
+    if not uploaded:
+        st.info(f"Sin Excel subido. Máximo {MAX_BATCH_ISRCS} ISRCs por batch.")
+        return
+
+    try:
+        isrcs = parse_isrcs_from_excel(uploaded)
+    except Exception as e:
+        st.error(str(e))
+        return
+
+    if not isrcs:
+        st.error("Ningún ISRC válido detectado en el Excel.")
+        return
+    if len(isrcs) > MAX_BATCH_ISRCS:
+        st.warning(
+            f"Detectados {len(isrcs)} ISRCs pero el máximo permitido es "
+            f"{MAX_BATCH_ISRCS}. Se procesarán solo los primeros {MAX_BATCH_ISRCS}."
+        )
+        isrcs = isrcs[:MAX_BATCH_ISRCS]
+
+    platforms = _platforms_for_scope(scope)
+    est_calls = len(isrcs) * (len(platforms) + 1)
+    max_per_day = int(st.secrets.get("SOUNDCHARTS_MAX_PER_DAY", "5000"))
+    consumed = st.session_state.get("calls_today", 0)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("ISRCs detectados", f"{len(isrcs)}")
+    c2.metric("Llamadas API estimadas", f"~{est_calls:,}",
+              help="Aproximación. La cifra real puede bajar si los ISRCs ya estaban en cache.")
+    c3.metric("Consumido hoy", f"{consumed} / {max_per_day}")
+
+    if consumed + est_calls > max_per_day:
+        st.warning(
+            f"⚠️ Procesar este batch puede exceder el límite diario "
+            f"({consumed} + {est_calls} > {max_per_day}). Se cortará a mitad."
+        )
+
+    if not st.button("🚀 Procesar batch", type="primary"):
+        return
+
+    # Procesar
+    buster = st.session_state.get("cache_buster", "")
+    prog = st.progress(0.0, text="Empezando…")
+    def _cb(i, total, isrc):
+        prog.progress(i / max(total, 1), text=f"{i}/{total} — {isrc}")
+    t0 = time.time()
+    res = batch_search(isrcs, platforms, buster=buster, progress_cb=_cb)
+    prog.empty()
+    st.session_state.calls_today = consumed + res["calls_used"]
+    st.session_state.batch_result = res
+    st.session_state.batch_isrcs = isrcs
+
+    show_batch_result()
+
+
+def show_batch_result():
+    """Muestra el resultado del último batch (si existe)."""
+    res = st.session_state.get("batch_result")
+    isrcs = st.session_state.get("batch_isrcs", [])
+    if not res:
+        return
+    pls = res["playlists"]
+    n_found = len(res["meta"])
+    n_not_found = len(res["not_found"])
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("ISRCs procesados", len(isrcs))
+    k2.metric("Resueltos", f"{n_found} / {len(isrcs)}")
+    k3.metric("Total playlists", len(pls))
+    k4.metric("Llamadas API", res["calls_used"])
+
+    if n_not_found:
+        with st.expander(f"⚠️ {n_not_found} ISRCs sin resultado"):
+            for isrc, motivo in res["not_found"][:50]:
+                st.text(f"{isrc} — {motivo}")
+
+    if not pls:
+        st.info("Sin placements en el lote.")
+        return
+
+    # Filtros
+    f1, f2 = st.columns(2)
+    with f1:
+        all_types = sorted({p.get("playlist_type") or "(sin tipo)" for p in pls})
+        types_sel = st.multiselect(
+            "Filtrar por tipo", all_types,
+            default=[t for t in all_types if t != "Curators & Listeners"],
+            key="batch_types",
+        )
+    with f2:
+        min_subs = st.number_input("Mínimo subscribers", min_value=0, value=0,
+                                    step=1000, key="batch_subs")
+
+    pls_view = [
+        p for p in pls
+        if (p.get("playlist_type") or "(sin tipo)") in types_sel
+        and (p.get("subscriber_count") or 0) >= min_subs
+    ]
+    st.caption(f"Mostrando {len(pls_view):,} / {len(pls):,} placements")
+
+    # Tabla descargable
+    df_view = pd.DataFrame(pls_view)
+    show_cols = [c for c in [
+        "isrc", "song_name", "credit_name", "platform", "playlist_name",
+        "playlist_type", "country_code", "subscriber_count", "position",
+        "entry_date",
+    ] if c in df_view.columns]
+    st.dataframe(
+        df_view[show_cols].rename(columns={
+            "isrc": "ISRC", "song_name": "Canción", "credit_name": "Artista",
+            "platform": "Plataforma", "playlist_name": "Playlist",
+            "playlist_type": "Tipo", "country_code": "Países",
+            "subscriber_count": "Subscribers", "position": "Pos",
+            "entry_date": "Entró",
+        }),
+        width="stretch", hide_index=True, height=500,
+    )
+
+    csv = df_view.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "📥 Descargar CSV",
+        data=csv,
+        file_name=f"placements_batch_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+        mime="text/csv",
+    )
+
+    st.info(
+        "💡 Si quieres crear una playlist en Spotify con estos ISRCs, ve a la "
+        "pestaña **🎵 Crear playlist Spotify**."
+    )
+
+
+def tab_playlist():
+    """Tab 3 — crear playlist Spotify con los ISRCs del batch (o pegados a mano)."""
+    cid = st.secrets.get("SPOTIFY_CLIENT_ID", "").strip()
+    if not cid:
+        st.error(
+            "⚠️ Funcionalidad no configurada. Falta `SPOTIFY_CLIENT_ID` y "
+            "`SPOTIFY_CLIENT_SECRET` en Streamlit Cloud Secrets, además de "
+            "registrar la URL `https://musicadders-isrc.streamlit.app/` como "
+            "Redirect URI en developer.spotify.com."
+        )
+        return
+
+    # Conexión Spotify del usuario
+    if not st.session_state.get("spotify_refresh_token"):
+        url = spotify_login_url()
+        st.markdown(
+            "Para crear playlists necesitas conectar tu cuenta Spotify (1 sola vez):"
+        )
+        st.markdown(
+            f"<a href='{url}' target='_self' "
+            f"style='display:inline-block;padding:0.8rem 2rem;background:#1ED760;"
+            f"color:white;text-decoration:none;border-radius:50px;font-weight:600;'>"
+            f"🎵 Conectar mi cuenta Spotify</a>",
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Se abrirá Spotify para que autorices la app a crear playlists en tu cuenta. "
+            "Al volver, esta página te mostrará confirmación."
+        )
+        return
+
+    # Ya conectado
+    uid = spotify_user_id()
+    if not uid:
+        st.warning("Token Spotify caducado. Vuelve a conectar.")
+        if st.button("🔁 Reconectar Spotify"):
+            for k in ("spotify_refresh_token", "spotify_access_token",
+                      "spotify_token_expires", "spotify_user_id", "spotify_display_name"):
+                st.session_state.pop(k, None)
+            st.rerun()
+        return
+
+    display = st.session_state.get("spotify_display_name") or uid
+    col_s1, col_s2 = st.columns([4, 1])
+    with col_s1:
+        st.success(f"✅ Spotify conectado: **{display}**")
+    with col_s2:
+        if st.button("🔌 Desconectar"):
+            for k in ("spotify_refresh_token", "spotify_access_token",
+                      "spotify_token_expires", "spotify_user_id", "spotify_display_name"):
+                st.session_state.pop(k, None)
+            st.rerun()
+
+    # Fuente de ISRCs: batch reciente o pegar a mano
+    st.markdown("##### Fuente de ISRCs")
+    source = st.radio(
+        "Origen",
+        ["Usar batch reciente", "Pegar lista manual"],
+        horizontal=True, label_visibility="collapsed",
+    )
+    if source == "Usar batch reciente":
+        batch_isrcs = st.session_state.get("batch_isrcs", [])
+        if not batch_isrcs:
+            st.info(
+                "No hay batch reciente. Procesa primero un Excel en la pestaña "
+                "📊 Procesar Excel o usa 'Pegar lista manual'."
             )
-            subs = p.get("subscriber_count")
-            subs_fmt = (
-                f"{subs:,}" if subs and subs >= 1000
-                else (str(subs) if subs else "—")
-            )
-            pos = p.get("position") or "—"
-            countries = p.get("country_code") or ""
-            variantes = f" · {p['n_variantes']} variantes" if p.get("n_variantes", 1) > 1 else ""
-            entry = (p.get("entry_date") or "")[:10]
-            meta_line = (
-                f"{t} · "
-                f"pos #{pos} · "
-                f"{subs_fmt} subs · "
-                f"{countries or 'global'}"
-                f"{variantes}"
-                f"{' · entró ' + entry if entry else ''}"
-            )
-            st.markdown(
-                f"<div class='ma-pl-card {css_class}'>"
-                f"<div class='pl-name'>{p.get('playlist_name','?')}</div>"
-                f"<div class='pl-meta'>{meta_line}</div>"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
+            return
+        # Filtrar a los que SÍ se resolvieron en Soundcharts
+        meta = (st.session_state.get("batch_result") or {}).get("meta") or {}
+        isrcs = [i for i in batch_isrcs if i in meta]
+        st.caption(f"Usando {len(isrcs)} ISRCs del último batch (los que Soundcharts resolvió).")
+    else:
+        text = st.text_area(
+            "Pega ISRCs (uno por línea o separados por coma/espacio):",
+            placeholder="ES14H2600001\nES64E2605990\n...",
+            height=160,
+        )
+        raw = re.split(r"[,\s]+", (text or "").upper())
+        isrcs = [i for i in raw if re.fullmatch(r"[A-Z]{2}[A-Z0-9]{3}\d{7}", i)]
+        st.caption(f"{len(isrcs)} ISRCs válidos detectados.")
+
+    if not isrcs:
+        return
+    if len(isrcs) > MAX_BATCH_ISRCS:
+        st.warning(f"Máximo {MAX_BATCH_ISRCS} por playlist. Se cortarán los primeros.")
+        isrcs = isrcs[:MAX_BATCH_ISRCS]
+
+    st.markdown("##### Detalles de la playlist")
+    col_n, col_p = st.columns([3, 1])
+    with col_n:
+        default_name = f"Musicadders selección · {datetime.now().strftime('%Y-%m-%d')}"
+        pl_name = st.text_input("Nombre", value=default_name)
+        pl_desc = st.text_input("Descripción (opcional)",
+                                 value=f"Creada desde el buscador Musicadders · {len(isrcs)} ISRCs")
+    with col_p:
+        pl_public = st.checkbox("Pública", value=False,
+                                help="Si NO la marcas, será privada en tu cuenta Spotify.")
+        create_btn = st.button("🎵 Crear playlist", type="primary", width="stretch")
+
+    if not create_btn:
+        return
+    if not pl_name.strip():
+        st.error("Pon un nombre a la playlist.")
+        return
+
+    # Resolver ISRCs a URIs Spotify
+    prog = st.progress(0.0, text="Resolviendo ISRCs en Spotify…")
+    uris = []
+    missing = []
+    for i, isrc in enumerate(isrcs):
+        prog.progress((i + 1) / len(isrcs), text=f"{i+1}/{len(isrcs)} — {isrc}")
+        uri = spotify_find_uri_by_isrc(isrc)
+        if uri:
+            uris.append(uri)
+        else:
+            missing.append(isrc)
+    prog.empty()
+
+    if not uris:
+        st.error("Ningún ISRC resolvió a un track Spotify. Nada que crear.")
+        return
+
+    with st.spinner(f"Creando playlist con {len(uris)} tracks…"):
+        pl = spotify_create_playlist(pl_name.strip(), pl_desc.strip(), public=pl_public)
+    if not pl:
+        st.error("No se pudo crear la playlist. ¿Token Spotify expirado?")
+        return
+
+    with st.spinner("Añadiendo tracks…"):
+        added = spotify_add_tracks(pl["id"], uris)
+
+    url = (pl.get("external_urls") or {}).get("spotify")
+    st.success(
+        f"✅ Playlist creada con **{added}** tracks de {len(isrcs)} ISRCs. "
+        f"{len(missing)} no se encontraron en Spotify."
+    )
+    if url:
+        st.markdown(f"### 🔗 [Abrir la playlist en Spotify]({url})")
+    if missing:
+        with st.expander(f"⚠️ {len(missing)} ISRCs no encontrados en Spotify"):
+            st.text("\n".join(missing))
+
+
+def main_view():
+    user = st.session_state.user_email
+
+    # Procesar callback Spotify si la URL trae ?code=
+    handle_spotify_callback()
+
+    # Header con logout
+    col_h, col_logout = st.columns([5, 1])
+    with col_h:
+        st.markdown(
+            f"""
+<div class='ma-header'>
+  <h1>🎵 Buscador de placements</h1>
+  <div class='sub'>Hola, <b>{user}</b></div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+    with col_logout:
+        st.write("")
+        if st.button("Salir", width="stretch"):
+            for k in list(st.session_state.keys()):
+                del st.session_state[k]
+            st.rerun()
+
+    tab1, tab2, tab3 = st.tabs([
+        "🔍 Buscar 1 ISRC",
+        f"📊 Procesar Excel (max {MAX_BATCH_ISRCS})",
+        "🎵 Crear playlist Spotify",
+    ])
+    with tab1:
+        tab_individual()
+    with tab2:
+        tab_batch()
+        # Si ya hay resultado de batch, mostrarlo (sobrevive a reruns)
+        if st.session_state.get("batch_result") and not st.session_state.get("_batch_just_processed"):
+            with st.expander("📋 Resultados del último batch procesado", expanded=False):
+                show_batch_result()
+    with tab3:
+        tab_playlist()
 
 
 # ════════════════════════════════════════════════════════════════════════════
