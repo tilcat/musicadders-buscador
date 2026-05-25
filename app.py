@@ -976,8 +976,8 @@ def tab_playlist():
         )
         if not uploaded:
             st.info(
-                f"Sube un Excel/CSV con una columna `ISRC`. Máximo {MAX_BATCH_ISRCS} "
-                "ISRCs. No consume llamadas Soundcharts: solo se resuelve contra Spotify."
+                "Sube un Excel/CSV con una columna `ISRC`. Sin límite de cantidad. "
+                "No consume llamadas Soundcharts: solo se resuelve contra Spotify."
             )
             return
         try:
@@ -998,9 +998,6 @@ def tab_playlist():
 
     if not isrcs:
         return
-    if len(isrcs) > MAX_BATCH_ISRCS:
-        st.warning(f"Máximo {MAX_BATCH_ISRCS} por playlist. Se cortarán los primeros.")
-        isrcs = isrcs[:MAX_BATCH_ISRCS]
 
     st.markdown("##### Detalles de la playlist")
     col_n, col_p = st.columns([3, 1])
