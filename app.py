@@ -949,11 +949,11 @@ def tab_playlist():
                 st.session_state.pop(k, None)
             st.rerun()
 
-    # Fuente de ISRCs: batch reciente o pegar a mano
+    # Fuente de ISRCs: batch reciente, subir Excel o pegar a mano
     st.markdown("##### Fuente de ISRCs")
     source = st.radio(
         "Origen",
-        ["Usar batch reciente", "Pegar lista manual"],
+        ["Subir Excel", "Usar batch reciente", "Pegar lista manual"],
         horizontal=True, label_visibility="collapsed",
     )
     if source == "Usar batch reciente":
@@ -961,13 +961,31 @@ def tab_playlist():
         if not batch_isrcs:
             st.info(
                 "No hay batch reciente. Procesa primero un Excel en la pestaña "
-                "📊 Procesar Excel o usa 'Pegar lista manual'."
+                "📊 Procesar Excel, o usa 'Subir Excel' / 'Pegar lista manual'."
             )
             return
         # Filtrar a los que SÍ se resolvieron en Soundcharts
         meta = (st.session_state.get("batch_result") or {}).get("meta") or {}
         isrcs = [i for i in batch_isrcs if i in meta]
         st.caption(f"Usando {len(isrcs)} ISRCs del último batch (los que Soundcharts resolvió).")
+    elif source == "Subir Excel":
+        uploaded = st.file_uploader(
+            "Excel/CSV con columna ISRC",
+            type=["xlsx", "xls", "csv"],
+            key="playlist_upload",
+        )
+        if not uploaded:
+            st.info(
+                f"Sube un Excel/CSV con una columna `ISRC`. Máximo {MAX_BATCH_ISRCS} "
+                "ISRCs. No consume llamadas Soundcharts: solo se resuelve contra Spotify."
+            )
+            return
+        try:
+            isrcs = parse_isrcs_from_excel(uploaded)
+        except Exception as e:
+            st.error(str(e))
+            return
+        st.caption(f"{len(isrcs)} ISRCs válidos detectados en el archivo.")
     else:
         text = st.text_area(
             "Pega ISRCs (uno por línea o separados por coma/espacio):",
