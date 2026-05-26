@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -318,12 +319,47 @@ def _app_base_url() -> str:
     return str(st.secrets.get("APP_BASE_URL", "https://musicadders-isrc.streamlit.app")).rstrip("/")
 
 
+def _state_secret_key() -> bytes:
+    """Clave HMAC para firmar el `state` OAuth. Deriva de CLIENT_SECRET de Spotify
+    (ya gestionado en Streamlit Secrets), así no requiere config adicional."""
+    cs = st.secrets.get("SPOTIFY_CLIENT_SECRET", "") or "ma-default-key"
+    return hashlib.sha256(cs.encode("utf-8")).digest()
+
+
+def _encode_oauth_state(user_email: str) -> str:
+    """Codifica {nonce, email} en un state firmado HMAC. Permite recuperar el
+    email tras la redirección OAuth aunque Streamlit pierda la sesión."""
+    payload = {"n": _secrets_mod.token_urlsafe(8), "u": user_email or "",
+               "t": int(time.time())}
+    raw = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    sig = hmac.new(_state_secret_key(), raw.encode(), hashlib.sha256).hexdigest()[:16]
+    return f"{raw}.{sig}"
+
+
+def _decode_oauth_state(state: str) -> dict | None:
+    """Verifica firma HMAC y devuelve el payload. None si inválido o caducado (>30 min)."""
+    if not state or "." not in state:
+        return None
+    raw, sig = state.rsplit(".", 1)
+    expected = hmac.new(_state_secret_key(), raw.encode(), hashlib.sha256).hexdigest()[:16]
+    if not hmac.compare_digest(sig, expected):
+        return None
+    try:
+        pad = "=" * (-len(raw) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(raw + pad))
+    except Exception:
+        return None
+    if int(time.time()) - int(payload.get("t", 0)) > 1800:
+        return None  # state demasiado antiguo
+    return payload
+
+
 def spotify_login_url() -> str | None:
     """Genera la URL de autorización Spotify para el user actual."""
     cid = st.secrets.get("SPOTIFY_CLIENT_ID", "").strip()
     if not cid:
         return None
-    state = _secrets_mod.token_urlsafe(16)
+    state = _encode_oauth_state(st.session_state.get("user_email", ""))
     st.session_state.spotify_oauth_state = state
     params = {
         "client_id": cid,
@@ -635,17 +671,29 @@ def spotify_add_tracks(playlist_id: str, uris: list[str]) -> int:
 
 def handle_spotify_callback():
     """Si la URL trae ?code=...&state=..., intercambia y guarda el refresh_token.
-    Limpia los query params después para que el reload no re-intercambie."""
+    Si Streamlit perdió la sesión durante el round-trip OAuth (cookies cross-site),
+    restaura user_email desde el state firmado. Limpia query params al final."""
     qp = st.query_params
     code = qp.get("code")
     state = qp.get("state")
     if not code:
         return
+
+    # Validación de state: preferimos verificar HMAC; el viejo formato (token plano
+    # en sesión) sigue funcionando por compatibilidad si la sesión sobrevivió.
+    payload = _decode_oauth_state(state) if state else None
     expected_state = st.session_state.get("spotify_oauth_state")
-    if expected_state and state != expected_state:
-        st.error("OAuth Spotify: state mismatch — vuelve a conectar.")
+    state_ok = (payload is not None) or (expected_state and state == expected_state)
+    if not state_ok:
+        st.error("OAuth Spotify: state inválido o caducado — vuelve a conectar.")
         st.query_params.clear()
         return
+
+    # Restaurar sesión de usuario si se perdió (cookies SameSite cross-site)
+    if payload and not st.session_state.get("user_email") and payload.get("u"):
+        st.session_state.user_email = payload["u"]
+        st.session_state.login_at = datetime.now(timezone.utc).isoformat()
+
     data = spotify_exchange_code(code)
     if data:
         st.session_state.spotify_refresh_token = data.get("refresh_token")
@@ -1421,9 +1469,6 @@ def tab_playlist():
 def main_view():
     user = st.session_state.user_email
 
-    # Procesar callback Spotify si la URL trae ?code=
-    handle_spotify_callback()
-
     # Header con logout
     col_h, col_logout = st.columns([5, 1])
     with col_h:
@@ -1459,6 +1504,11 @@ def main_view():
 # ════════════════════════════════════════════════════════════════════════════
 # Entry point
 # ════════════════════════════════════════════════════════════════════════════
+# Procesar callback Spotify ANTES de decidir login vs main: si la sesión
+# Streamlit se perdió durante el round-trip OAuth, handle_spotify_callback()
+# restaura user_email desde el state firmado.
+handle_spotify_callback()
+
 if "user_email" not in st.session_state:
     login_view()
 else:
