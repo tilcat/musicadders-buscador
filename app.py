@@ -448,30 +448,44 @@ def spotify_find_uri_by_isrc(isrc: str) -> str | None:
 
 
 def spotify_resolve_isrcs(isrcs: list[str], progress_cb=None,
-                           max_workers: int = 8) -> dict:
+                           max_workers: int = 16) -> dict:
     """Resuelve ISRCs → URIs Spotify en paralelo, preservando orden.
 
-    Usa Client Credentials (token de app) para no consumir el cupo del user.
-    Maneja 429 con Retry-After (cap 20s) y reintenta hasta 4 veces por ISRC.
-    Devuelve {"uris": [...], "not_found": [...], "errors": [...], "stopped": bool}.
+    Usa Client Credentials (token de app) + Session HTTP compartida con
+    connection pooling, para reducir overhead de TLS handshake.
+    Maneja 429 con Retry-After (cap 10s) y reintenta hasta 4 veces por ISRC.
     """
     tok = spotify_client_credentials_token()
     if not tok:
         return {"uris": [], "not_found": [], "errors": [(i, "no CC token") for i in isrcs],
                 "stopped": True, "reason": "No se pudo obtener Client Credentials token."}
 
+    # Session compartida con pool grande: reusa conexiones TLS entre hilos
+    sess = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=max_workers, pool_maxsize=max_workers * 2,
+    )
+    sess.mount("https://", adapter)
+
     lock = threading.Lock()
     tok_ref = {"v": tok}
+    # Si Spotify nos manda un 429 con Retry-After largo, pausamos todos
+    # los hilos en lugar de que cada uno espere de forma independiente.
+    cooldown_until = {"t": 0.0}
 
     def _resolve_one(isrc: str) -> tuple[str, str, str | None]:
         """(isrc, kind, value). kind ∈ {'uri','notfound','error'}."""
         attempts = 0
         while attempts < 4:
             attempts += 1
+            # Respeta cooldown global si está activo
+            wait_global = cooldown_until["t"] - time.time()
+            if wait_global > 0:
+                time.sleep(min(wait_global, 10))
             with lock:
                 cur_tok = tok_ref["v"]
             try:
-                r = requests.get(
+                r = sess.get(
                     f"{SP_API}/search",
                     headers={"Authorization": f"Bearer {cur_tok}"},
                     params={"q": f"isrc:{isrc}", "type": "track", "limit": 1},
@@ -498,10 +512,12 @@ def spotify_resolve_isrcs(isrcs: list[str], progress_cb=None,
             if r.status_code == 429:
                 ra = r.headers.get("Retry-After")
                 try:
-                    wait = min(int(ra), 20) if ra else 3
+                    wait = min(int(ra), 10) if ra else 2
                 except ValueError:
-                    wait = 3
-                time.sleep(wait + 0.1 * attempts)  # jitter para no sincronizar hilos
+                    wait = 2
+                # Cooldown global: el resto de hilos lo respeta y no martillean Spotify
+                cooldown_until["t"] = max(cooldown_until["t"], time.time() + wait)
+                time.sleep(wait + 0.05 * attempts)
                 continue
 
             if 500 <= r.status_code < 600 and attempts <= 2:
@@ -1180,12 +1196,14 @@ def tab_playlist():
         st.error("Pon un nombre a la playlist.")
         return
 
-    # Aviso para volúmenes grandes (paralelo: ~30-50 ISRCs/seg estables)
+    # Aviso para volúmenes grandes (16 workers + pool: ~50-100 ISRCs/seg)
     if len(isrcs) > 1000:
-        est_min = max(1, int(len(isrcs) / 30 / 60))
+        est_min_low = max(1, int(len(isrcs) / 100 / 60))
+        est_min_high = max(2, int(len(isrcs) / 30 / 60))
         st.warning(
-            f"⏳ {len(isrcs):,} ISRCs — resolverlos puede tardar ~{est_min}-{est_min*2} min "
-            "(rate limit de Spotify). Spotify limita una playlist a 10.000 tracks."
+            f"⏳ {len(isrcs):,} ISRCs — estimado ~{est_min_low}-{est_min_high} min "
+            "(depende del rate limit de Spotify en ese momento). "
+            "Spotify limita una playlist a 10.000 tracks."
         )
 
     # Resolver ISRCs a URIs Spotify con la función robusta
