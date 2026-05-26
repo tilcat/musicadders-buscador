@@ -25,8 +25,10 @@ import io
 import os
 import re
 import secrets as _secrets_mod
+import threading
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -402,6 +404,33 @@ def spotify_user_id() -> str | None:
     return st.session_state.spotify_user_id
 
 
+def spotify_client_credentials_token() -> str | None:
+    """Token a nivel de app (Client Credentials). Independiente del user OAuth.
+    Útil para Search masivo: tiene su propio bucket de rate limit."""
+    tok = st.session_state.get("sp_cc_token")
+    exp = st.session_state.get("sp_cc_token_exp", 0)
+    if tok and time.time() < exp - 60:
+        return tok
+    cid = st.secrets.get("SPOTIFY_CLIENT_ID", "").strip()
+    cs = st.secrets.get("SPOTIFY_CLIENT_SECRET", "").strip()
+    if not (cid and cs):
+        return None
+    auth = base64.b64encode(f"{cid}:{cs}".encode()).decode()
+    r = requests.post(
+        SP_TOKEN_URL,
+        headers={"Authorization": f"Basic {auth}",
+                 "Content-Type": "application/x-www-form-urlencoded"},
+        data={"grant_type": "client_credentials"},
+        timeout=15,
+    )
+    if r.status_code != 200:
+        return None
+    d = r.json()
+    st.session_state.sp_cc_token = d["access_token"]
+    st.session_state.sp_cc_token_exp = time.time() + int(d.get("expires_in", 3600))
+    return d["access_token"]
+
+
 def spotify_find_uri_by_isrc(isrc: str) -> str | None:
     tok = spotify_get_token()
     if not tok:
@@ -418,90 +447,118 @@ def spotify_find_uri_by_isrc(isrc: str) -> str | None:
     return items[0]["uri"] if items else None
 
 
-def spotify_resolve_isrcs(isrcs: list[str], progress_cb=None) -> dict:
-    """Resuelve una lista de ISRCs a URIs Spotify con sesión + retry + diagnóstico.
+def spotify_resolve_isrcs(isrcs: list[str], progress_cb=None,
+                           max_workers: int = 8) -> dict:
+    """Resuelve ISRCs → URIs Spotify en paralelo, preservando orden.
 
-    Maneja:
-      - 401: refresh token y reintenta una vez.
-      - 429: respeta Retry-After (con tope) y reintenta.
-      - 5xx: backoff exponencial corto.
-
+    Usa Client Credentials (token de app) para no consumir el cupo del user.
+    Maneja 429 con Retry-After (cap 20s) y reintenta hasta 4 veces por ISRC.
     Devuelve {"uris": [...], "not_found": [...], "errors": [...], "stopped": bool}.
-    Si la auth se rompe del todo (no se puede refrescar), `stopped=True` para
-    no procesar miles de ISRCs en vacío.
     """
-    sess = requests.Session()
-    tok = spotify_get_token()
+    tok = spotify_client_credentials_token()
     if not tok:
-        return {"uris": [], "not_found": [], "errors": isrcs, "stopped": True,
-                "reason": "No hay token Spotify válido."}
+        return {"uris": [], "not_found": [], "errors": [(i, "no CC token") for i in isrcs],
+                "stopped": True, "reason": "No se pudo obtener Client Credentials token."}
 
-    uris: list[str] = []
-    not_found: list[str] = []
-    errors: list[tuple[str, str]] = []
-    stopped = False
-    reason = ""
+    lock = threading.Lock()
+    tok_ref = {"v": tok}
 
-    for i, isrc in enumerate(isrcs):
-        if progress_cb:
-            progress_cb(i + 1, len(isrcs), isrc)
-
+    def _resolve_one(isrc: str) -> tuple[str, str, str | None]:
+        """(isrc, kind, value). kind ∈ {'uri','notfound','error'}."""
         attempts = 0
-        while True:
+        while attempts < 4:
             attempts += 1
+            with lock:
+                cur_tok = tok_ref["v"]
             try:
-                r = sess.get(
+                r = requests.get(
                     f"{SP_API}/search",
-                    headers={"Authorization": f"Bearer {tok}"},
+                    headers={"Authorization": f"Bearer {cur_tok}"},
                     params={"q": f"isrc:{isrc}", "type": "track", "limit": 1},
                     timeout=15,
                 )
             except requests.RequestException as e:
-                errors.append((isrc, f"network: {str(e)[:60]}"))
-                break
+                return (isrc, "error", f"net: {str(e)[:50]}")
 
             if r.status_code == 200:
                 items = (r.json().get("tracks") or {}).get("items") or []
-                if items:
-                    uris.append(items[0]["uri"])
-                else:
-                    not_found.append(isrc)
-                break
+                return (isrc, "uri", items[0]["uri"]) if items else (isrc, "notfound", None)
 
-            if r.status_code == 401 and attempts == 1:
-                new_tok = spotify_refresh_access_token()
-                if not new_tok:
-                    stopped = True
-                    reason = "Token Spotify expirado y no se pudo refrescar."
-                    errors.append((isrc, "auth 401"))
-                    break
-                tok = new_tok
-                continue
+            if r.status_code == 401:
+                # CC token caducó: renovar (un solo hilo a la vez)
+                with lock:
+                    if tok_ref["v"] == cur_tok:
+                        new_tok = spotify_client_credentials_token()
+                        if new_tok:
+                            tok_ref["v"] = new_tok
+                if attempts <= 2:
+                    continue
+                return (isrc, "error", "auth 401")
 
             if r.status_code == 429:
                 ra = r.headers.get("Retry-After")
                 try:
-                    wait = min(int(ra), 30) if ra else 5
+                    wait = min(int(ra), 20) if ra else 3
                 except ValueError:
-                    wait = 5
-                if attempts > 3:
-                    errors.append((isrc, f"rate-limited (esperé {wait}s x3)"))
-                    break
-                time.sleep(wait)
+                    wait = 3
+                time.sleep(wait + 0.1 * attempts)  # jitter para no sincronizar hilos
                 continue
 
             if 500 <= r.status_code < 600 and attempts <= 2:
                 time.sleep(2 * attempts)
                 continue
 
-            errors.append((isrc, f"http {r.status_code}"))
-            break
+            return (isrc, "error", f"http {r.status_code}")
 
-        if stopped:
-            break
+        return (isrc, "error", "rate-limited (4 intentos)")
+
+    results: dict[str, tuple[str, str, str | None]] = {}
+    completed = 0
+    ok = 0
+    nf = 0
+    err = 0
+    total = len(isrcs)
+    last_update = 0.0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_resolve_one, i): i for i in isrcs}
+        for fut in as_completed(futures):
+            isrc = futures[fut]
+            try:
+                res = fut.result()
+            except Exception as e:
+                res = (isrc, "error", f"exc: {str(e)[:50]}")
+            results[isrc] = res
+            completed += 1
+            kind = res[1]
+            if kind == "uri":
+                ok += 1
+            elif kind == "notfound":
+                nf += 1
+            else:
+                err += 1
+            # Throttle UI updates: cada 25 ISRCs o cada 0.5s
+            now = time.time()
+            if progress_cb and (completed % 25 == 0 or completed == total
+                                or now - last_update > 0.5):
+                progress_cb(completed, total, f"✅ {ok:,}  ❌ {nf:,}  ⚠️ {err:,}")
+                last_update = now
+
+    # Reordenar respetando el orden original
+    uris: list[str] = []
+    not_found: list[str] = []
+    errors: list[tuple[str, str]] = []
+    for isrc in isrcs:
+        kind, val = results[isrc][1], results[isrc][2]
+        if kind == "uri":
+            uris.append(val)
+        elif kind == "notfound":
+            not_found.append(isrc)
+        else:
+            errors.append((isrc, val or "?"))
 
     return {"uris": uris, "not_found": not_found, "errors": errors,
-            "stopped": stopped, "reason": reason}
+            "stopped": False, "reason": ""}
 
 
 def spotify_create_playlist(name: str, description: str = "", public: bool = False) -> dict | None:
@@ -1123,11 +1180,11 @@ def tab_playlist():
         st.error("Pon un nombre a la playlist.")
         return
 
-    # Aviso para volúmenes grandes
+    # Aviso para volúmenes grandes (paralelo: ~30-50 ISRCs/seg estables)
     if len(isrcs) > 1000:
-        est_min = max(1, int(len(isrcs) * 0.4 / 60))
+        est_min = max(1, int(len(isrcs) / 30 / 60))
         st.warning(
-            f"⏳ {len(isrcs):,} ISRCs — resolverlos puede tardar ~{est_min} min "
+            f"⏳ {len(isrcs):,} ISRCs — resolverlos puede tardar ~{est_min}-{est_min*2} min "
             "(rate limit de Spotify). Spotify limita una playlist a 10.000 tracks."
         )
 
