@@ -1151,7 +1151,7 @@ def render_client_side_playlist_creator(
   const okEl = $('ma-ok'), nfEl = $('ma-nf'), erEl = $('ma-er'), result = $('ma-result');
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-  async function sFetch(url, opts = {}) {
+  async function sFetch(url, opts = {}, maxRetries = 3) {
     let attempts = 0;
     while (true) {
       attempts++;
@@ -1165,9 +1165,9 @@ def render_client_side_playlist_creator(
         if (attempts < 3) { await sleep(500); continue; }
         throw e;
       }
-      if (r.status === 429) {
-        const w = Math.min(Number(r.headers.get('Retry-After') || 2) + 1, 30);
-        sub.textContent = `Rate limit · esperando ${w}s…`;
+      if (r.status === 429 && attempts < maxRetries) {
+        const w = Math.min(Number(r.headers.get('Retry-After') || 2) + 1, 15);
+        sub.textContent = `Rate limit · esperando ${w}s… (intento ${attempts}/${maxRetries})`;
         await sleep(w * 1000);
         continue;
       }
