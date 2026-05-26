@@ -1199,7 +1199,12 @@ def render_client_side_playlist_creator(
   const okEl = $('ma-ok'), nfEl = $('ma-nf'), erEl = $('ma-er'), result = $('ma-result');
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-  async function sFetch(url, opts = {}, maxRetries = 3) {
+  // Throttle adaptativo: 0ms al empezar; sube en 429, baja en éxito.
+  let interReqDelay = 0;
+  const MAX_DELAY = 2000, MIN_DELAY = 0;
+
+  async function sFetch(url, opts = {}, maxRetries = 6) {
+    if (interReqDelay > 0) await sleep(interReqDelay);
     let attempts = 0;
     while (true) {
       attempts++;
@@ -1214,10 +1219,16 @@ def render_client_side_playlist_creator(
         throw e;
       }
       if (r.status === 429 && attempts < maxRetries) {
-        const w = Math.min(Number(r.headers.get('Retry-After') || 2) + 1, 15);
-        sub.textContent = `Rate limit · esperando ${w}s… (intento ${attempts}/${maxRetries})`;
+        const w = Math.min(Number(r.headers.get('Retry-After') || 2) + 1, 30);
+        // AIMD: aumento agresivo del delay en 429
+        interReqDelay = Math.min(MAX_DELAY, Math.max(interReqDelay * 2, 250));
+        sub.textContent = `Rate limit · esperando ${w}s · throttle ${interReqDelay}ms (intento ${attempts}/${maxRetries})`;
         await sleep(w * 1000);
         continue;
+      }
+      // Éxito: reducción suave del delay (decremento lineal)
+      if (r.ok && interReqDelay > MIN_DELAY) {
+        interReqDelay = Math.max(MIN_DELAY, interReqDelay - 5);
       }
       return r;
     }
