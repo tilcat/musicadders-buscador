@@ -22,6 +22,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import json
 import os
 import re
 import secrets as _secrets_mod
@@ -36,6 +37,7 @@ import bcrypt
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1075,6 +1077,203 @@ def show_batch_result():
     )
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# COMPONENTE CLIENT-SIDE: resolución + creación de playlist en el navegador.
+# Streamlit Cloud (servidor) tiene latencia alta y rate-limit con Spotify;
+# correr en el navegador del usuario es 10-50× más rápido (igual que
+# playlisttracker-v2).
+# ════════════════════════════════════════════════════════════════════════════
+def render_client_side_playlist_creator(
+    *, access_token: str, user_id: str, isrcs: list[str],
+    name: str, desc: str, public: bool,
+) -> None:
+    """Inyecta un iframe que hace toda la resolución + creación en el navegador."""
+    payload = {
+        "token": access_token,
+        "userId": user_id,
+        "isrcs": isrcs,
+        "name": name,
+        "desc": desc,
+        "public": bool(public),
+    }
+    payload_json = json.dumps(payload)
+
+    html = """
+<style>
+  .ma-pl-wrap {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    padding: 1.2rem 1.4rem;
+    background: #f9fafb;
+    border-radius: 12px;
+    border: 1px solid #e5e7eb;
+  }
+  .ma-pl-status { font-size: 0.95rem; color: #111827; margin-bottom: 0.4rem; font-weight: 600; }
+  .ma-pl-sub { font-size: 0.85rem; color: #6b7280; margin-bottom: 0.6rem; }
+  .ma-pl-bar { background: #e5e7eb; height: 10px; border-radius: 5px; overflow: hidden; margin: 0.6rem 0; }
+  .ma-pl-bar-fill { background: linear-gradient(90deg, #1ED760, #06B6D4); height: 100%; transition: width 0.25s; width: 0%; }
+  .ma-pl-counts { display: flex; gap: 1.2rem; font-size: 0.9rem; margin: 0.7rem 0; }
+  .ma-pl-counts b { display: block; font-size: 1.4rem; font-weight: 700; }
+  .ma-pl-counts .ok b { color: #16a34a; }
+  .ma-pl-counts .nf b { color: #6b7280; }
+  .ma-pl-counts .er b { color: #ef4444; }
+  .ma-pl-result { background: white; border-left: 4px solid #1ED760; padding: 1.1rem 1.3rem; margin-top: 1rem; border-radius: 8px; }
+  .ma-pl-result.err { border-left-color: #ef4444; }
+  .ma-pl-link {
+    display: inline-block; margin-top: 0.6rem;
+    color: white; background: #1ED760; padding: 0.6rem 1.2rem;
+    border-radius: 24px; font-weight: 700; text-decoration: none;
+  }
+  .ma-pl-link:hover { background: #19b452; }
+</style>
+<div class="ma-pl-wrap">
+  <div id="ma-status" class="ma-pl-status">Preparando…</div>
+  <div id="ma-sub" class="ma-pl-sub"></div>
+  <div class="ma-pl-bar"><div id="ma-bar" class="ma-pl-bar-fill"></div></div>
+  <div class="ma-pl-counts">
+    <div class="ok"><b id="ma-ok">0</b><span>encontrados</span></div>
+    <div class="nf"><b id="ma-nf">0</b><span>no en Spotify</span></div>
+    <div class="er"><b id="ma-er">0</b><span>errores</span></div>
+  </div>
+  <div id="ma-result"></div>
+</div>
+<script>
+(async () => {
+  const P = __PAYLOAD__;
+  let TOKEN = P.token;
+  const USER_ID = P.userId;
+  const ISRCS = P.isrcs;
+  const PL_NAME = P.name;
+  const PL_DESC = P.desc;
+  const PL_PUB = P.public;
+
+  const $ = id => document.getElementById(id);
+  const status = $('ma-status'), sub = $('ma-sub'), bar = $('ma-bar');
+  const okEl = $('ma-ok'), nfEl = $('ma-nf'), erEl = $('ma-er'), result = $('ma-result');
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  async function sFetch(url, opts = {}) {
+    let attempts = 0;
+    while (true) {
+      attempts++;
+      let r;
+      try {
+        r = await fetch(url, {
+          ...opts,
+          headers: { Authorization: 'Bearer ' + TOKEN, 'Content-Type': 'application/json', ...(opts.headers || {}) }
+        });
+      } catch (e) {
+        if (attempts < 3) { await sleep(500); continue; }
+        throw e;
+      }
+      if (r.status === 429) {
+        const w = Math.min(Number(r.headers.get('Retry-After') || 2) + 1, 30);
+        sub.textContent = `Rate limit · esperando ${w}s…`;
+        await sleep(w * 1000);
+        continue;
+      }
+      return r;
+    }
+  }
+
+  const uris = [];
+  const notFound = [];
+  const errors = [];
+  const t0 = performance.now();
+
+  status.textContent = `Resolviendo ${ISRCS.length.toLocaleString()} ISRCs en Spotify…`;
+
+  for (let i = 0; i < ISRCS.length; i++) {
+    const isrc = ISRCS[i];
+    try {
+      const r = await sFetch(`https://api.spotify.com/v1/search?q=isrc:${encodeURIComponent(isrc)}&type=track&limit=1`);
+      if (r.ok) {
+        const d = await r.json();
+        const items = (d && d.tracks && d.tracks.items) || [];
+        if (items.length) uris.push(items[0].uri);
+        else notFound.push(isrc);
+      } else {
+        errors.push(isrc + ' (http ' + r.status + ')');
+      }
+    } catch (e) {
+      errors.push(isrc + ' (' + (e.message || 'error') + ')');
+    }
+
+    if (i % 20 === 0 || i === ISRCS.length - 1) {
+      const done = i + 1;
+      const pct = (done / ISRCS.length) * 100;
+      bar.style.width = pct + '%';
+      const el = (performance.now() - t0) / 1000;
+      const rate = done / Math.max(el, 0.1);
+      const eta = Math.round((ISRCS.length - done) / Math.max(rate, 0.1));
+      sub.textContent = `${done.toLocaleString()} / ${ISRCS.length.toLocaleString()} · ${rate.toFixed(1)}/s · ETA ${eta}s`;
+      okEl.textContent = uris.length.toLocaleString();
+      nfEl.textContent = notFound.length.toLocaleString();
+      erEl.textContent = errors.length.toLocaleString();
+    }
+  }
+
+  const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+  bar.style.width = '100%';
+  sub.textContent = `Resolución completada en ${elapsed}s.`;
+
+  if (!uris.length) {
+    status.textContent = '❌ Sin tracks que añadir';
+    result.className = 'ma-pl-result err';
+    result.innerHTML = '<b>Ningún ISRC resolvió a un track Spotify.</b><br>'
+      + 'Revisa que estos ISRCs estén distribuidos en Spotify, o que el token siga vigente.';
+    return;
+  }
+
+  const toAdd = uris.slice(0, 10000);
+  if (uris.length > 10000) {
+    sub.textContent += ` · recortado a 10.000 (límite Spotify por playlist)`;
+  }
+
+  status.textContent = `Creando playlist con ${toAdd.length.toLocaleString()} tracks…`;
+  let pl;
+  try {
+    const r = await sFetch(`https://api.spotify.com/v1/users/${encodeURIComponent(USER_ID)}/playlists`, {
+      method: 'POST',
+      body: JSON.stringify({ name: PL_NAME, description: PL_DESC, public: PL_PUB })
+    });
+    if (!r.ok) throw new Error('http ' + r.status);
+    pl = await r.json();
+  } catch (e) {
+    status.textContent = '❌ Error al crear playlist';
+    result.className = 'ma-pl-result err';
+    result.innerHTML = '<b>No se pudo crear la playlist:</b> ' + (e.message || 'error desconocido');
+    return;
+  }
+
+  let added = 0;
+  for (let i = 0; i < toAdd.length; i += 100) {
+    const chunk = toAdd.slice(i, i + 100);
+    sub.textContent = `Añadiendo tracks ${(i + chunk.length).toLocaleString()} / ${toAdd.length.toLocaleString()}`;
+    try {
+      const r = await sFetch(`https://api.spotify.com/v1/playlists/${pl.id}/tracks`, {
+        method: 'POST',
+        body: JSON.stringify({ uris: chunk })
+      });
+      if (r.ok) added += chunk.length;
+    } catch (e) { /* sigue */ }
+  }
+
+  status.textContent = '✅ Playlist creada';
+  sub.textContent = `Tiempo total: ${((performance.now() - t0) / 1000).toFixed(1)}s`;
+  const url = (pl.external_urls && pl.external_urls.spotify) || '#';
+  result.className = 'ma-pl-result';
+  result.innerHTML = `
+    <div style="font-size:1rem;margin-bottom:0.3rem;"><b>${added.toLocaleString()} tracks añadidos</b> de ${ISRCS.length.toLocaleString()} ISRCs.</div>
+    <div style="font-size:0.85rem;color:#6b7280;">${notFound.length.toLocaleString()} no en Spotify · ${errors.length.toLocaleString()} errores.</div>
+    <a class="ma-pl-link" href="${url}" target="_blank">Abrir en Spotify →</a>
+  `;
+})();
+</script>
+"""
+    html = html.replace("__PAYLOAD__", payload_json)
+    components.html(html, height=440, scrolling=False)
+
+
 def tab_playlist():
     """Tab 3 — crear playlist Spotify con los ISRCs del batch (o pegados a mano)."""
     cid = st.secrets.get("SPOTIFY_CLIENT_ID", "").strip()
@@ -1196,71 +1395,27 @@ def tab_playlist():
         st.error("Pon un nombre a la playlist.")
         return
 
-    # Aviso para volúmenes grandes (16 workers + pool: ~50-100 ISRCs/seg)
-    if len(isrcs) > 1000:
-        est_min_low = max(1, int(len(isrcs) / 100 / 60))
-        est_min_high = max(2, int(len(isrcs) / 30 / 60))
-        st.warning(
-            f"⏳ {len(isrcs):,} ISRCs — estimado ~{est_min_low}-{est_min_high} min "
-            "(depende del rate limit de Spotify en ese momento). "
-            "Spotify limita una playlist a 10.000 tracks."
-        )
-
-    # Resolver ISRCs a URIs Spotify con la función robusta
-    prog = st.progress(0.0, text="Resolviendo ISRCs en Spotify…")
-    status = st.empty()
-    def _cb(i, total, isrc):
-        prog.progress(i / max(total, 1), text=f"{i:,}/{total:,} — {isrc}")
-    res = spotify_resolve_isrcs(isrcs, progress_cb=_cb)
-    prog.empty()
-    status.empty()
-
-    uris = res["uris"]
-    not_found = res["not_found"]
-    errors = res["errors"]
-
-    # Resumen diagnóstico
-    c1, c2, c3 = st.columns(3)
-    c1.metric("✅ Encontrados", f"{len(uris):,}")
-    c2.metric("❌ No en Spotify", f"{len(not_found):,}")
-    c3.metric("⚠️ Errores", f"{len(errors):,}")
-
-    if res["stopped"]:
-        st.error(f"🛑 Proceso interrumpido: {res['reason']} "
-                 "Vuelve a conectar Spotify desde el botón de arriba.")
-
-    if errors:
-        sample = ", ".join(f"{i} ({m})" for i, m in errors[:5])
-        with st.expander(f"⚠️ {len(errors):,} errores HTTP — muestra"):
-            st.text(sample + ("..." if len(errors) > 5 else ""))
-
-    if not uris:
-        st.error("Ningún ISRC resolvió a un track Spotify. Nada que crear.")
+    # Garantizar token válido y user_id antes de lanzar el componente
+    access_token = spotify_get_token()
+    user_id = spotify_user_id()
+    if not (access_token and user_id):
+        st.error("Token Spotify no disponible. Vuelve a conectar tu cuenta.")
         return
 
-    # Spotify limita una playlist a 10.000 tracks
-    if len(uris) > 10000:
-        st.warning(f"Spotify acepta máx 10.000 por playlist. Se añadirán los primeros 10.000 de {len(uris):,}.")
-        uris = uris[:10000]
-
-    with st.spinner(f"Creando playlist con {len(uris):,} tracks…"):
-        pl = spotify_create_playlist(pl_name.strip(), pl_desc.strip(), public=pl_public)
-    if not pl:
-        st.error("No se pudo crear la playlist. ¿Token Spotify expirado?")
-        return
-
-    with st.spinner("Añadiendo tracks…"):
-        added = spotify_add_tracks(pl["id"], uris)
-
-    url = (pl.get("external_urls") or {}).get("spotify")
-    st.success(
-        f"✅ Playlist creada con **{added:,}** tracks de {len(isrcs):,} ISRCs."
+    st.divider()
+    st.markdown("##### Creando playlist en tu navegador")
+    st.caption(
+        "La búsqueda y la creación corren localmente en tu navegador "
+        "(no en el servidor) — mucho más rápido y sin errores 429."
     )
-    if url:
-        st.markdown(f"### 🔗 [Abrir la playlist en Spotify]({url})")
-    if not_found:
-        with st.expander(f"❌ {len(not_found):,} ISRCs no encontrados en Spotify"):
-            st.text("\n".join(not_found[:500]) + ("\n..." if len(not_found) > 500 else ""))
+    render_client_side_playlist_creator(
+        access_token=access_token,
+        user_id=user_id,
+        isrcs=isrcs,
+        name=pl_name.strip(),
+        desc=pl_desc.strip(),
+        public=pl_public,
+    )
 
 
 def main_view():
