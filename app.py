@@ -1237,6 +1237,8 @@ def render_client_side_playlist_creator(
   const uris = [];
   const notFound = [];
   const errors = [];
+  const errorByCode = {};  // histograma de códigos HTTP
+  let tokenExpired = false;
   const t0 = performance.now();
 
   status.textContent = `Resolviendo ${ISRCS.length.toLocaleString()} ISRCs en Spotify…`;
@@ -1252,23 +1254,45 @@ def render_client_side_playlist_creator(
         else notFound.push(isrc);
       } else {
         errors.push(isrc + ' (http ' + r.status + ')');
+        errorByCode[r.status] = (errorByCode[r.status] || 0) + 1;
+        if (r.status === 401) {
+          tokenExpired = true;
+          console.error('Token Spotify expirado (HTTP 401). Abortando.');
+          break;
+        }
+        if (r.status === 403) {
+          // Insufficient scope o app sin permiso — abortar inmediato
+          console.error('HTTP 403 — la app no tiene permiso. Body:', await r.text().catch(() => ''));
+          break;
+        }
       }
     } catch (e) {
-      errors.push(isrc + ' (' + (e.message || 'error') + ')');
+      const m = e.message || 'error';
+      errors.push(isrc + ' (' + m + ')');
+      errorByCode['net'] = (errorByCode['net'] || 0) + 1;
     }
 
-    if (i % 20 === 0 || i === ISRCS.length - 1) {
+    if (i % 10 === 0 || i === ISRCS.length - 1) {
       const done = i + 1;
       const pct = (done / ISRCS.length) * 100;
       bar.style.width = pct + '%';
       const el = (performance.now() - t0) / 1000;
       const rate = done / Math.max(el, 0.1);
       const eta = Math.round((ISRCS.length - done) / Math.max(rate, 0.1));
-      sub.textContent = `${done.toLocaleString()} / ${ISRCS.length.toLocaleString()} · ${rate.toFixed(1)}/s · ETA ${eta}s`;
+      const codes = Object.entries(errorByCode).map(([k,v]) => k+':'+v).join(' ');
+      sub.textContent = `${done.toLocaleString()} / ${ISRCS.length.toLocaleString()} · ${rate.toFixed(1)}/s · ETA ${eta}s · throttle ${interReqDelay}ms` + (codes ? ` · errores [${codes}]` : '');
       okEl.textContent = uris.length.toLocaleString();
       nfEl.textContent = notFound.length.toLocaleString();
       erEl.textContent = errors.length.toLocaleString();
     }
+  }
+
+  if (tokenExpired) {
+    status.textContent = '🔑 Token Spotify expirado';
+    result.className = 'ma-pl-result err';
+    result.innerHTML = '<b>El token Spotify ha caducado durante el proceso.</b><br>' +
+      'Recarga la página (Cmd+R) y vuelve a lanzar — al renovar el token tendrás otra hora completa.';
+    return;
   }
 
   const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
