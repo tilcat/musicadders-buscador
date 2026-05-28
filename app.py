@@ -1319,7 +1319,31 @@ def render_client_side_playlist_creator(
       method: 'POST',
       body: JSON.stringify({ name: PL_NAME, description: PL_DESC, public: PL_PUB })
     });
-    if (!r.ok) throw new Error('http ' + r.status);
+    if (!r.ok) {
+      const bodyText = await r.text().catch(() => '');
+      let reason = '';
+      let hint = '';
+      try {
+        const j = JSON.parse(bodyText);
+        reason = (j.error && (j.error.message || j.error.reason)) || '';
+      } catch { reason = bodyText.slice(0, 200); }
+      if (r.status === 403) {
+        const low = (reason || '').toLowerCase();
+        if (low.includes('scope') || low.includes('insufficient')) {
+          hint = 'El token no tiene scope <code>playlist-modify-public</code>/<code>playlist-modify-private</code>. Pulsa 🔌 Desconectar y vuelve a conectar para forzar el scope correcto.';
+        } else {
+          hint = 'Causa probable: tu cuenta no está en <b>User Management</b> de la app Spotify configurada (Development Mode). Ve a developer.spotify.com → tu app → User Management → añade tu email exacto de Spotify. Alternativa: pulsa 🔌 Desconectar y reconecta por si era token viejo cacheado.';
+        }
+      } else if (r.status === 401) {
+        hint = 'Token caducado. Recarga la página y reconecta.';
+      } else {
+        hint = (reason || 'sin detalle');
+      }
+      status.textContent = '❌ Error al crear playlist';
+      result.className = 'ma-pl-result err';
+      result.innerHTML = '<b>HTTP ' + r.status + '</b>' + (reason ? ' — ' + reason : '') + '<br>' + hint;
+      return;
+    }
     pl = await r.json();
   } catch (e) {
     status.textContent = '❌ Error al crear playlist';
