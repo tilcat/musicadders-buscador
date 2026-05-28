@@ -1241,6 +1241,35 @@ def render_client_side_playlist_creator(
   let tokenExpired = false;
   const t0 = performance.now();
 
+  // Diagnóstico inicial: confirmar identidad del token antes de procesar.
+  let meId = null, meProduct = null, meEmail = null;
+  try {
+    const meR = await fetch('https://api.spotify.com/v1/me', {
+      headers: { Authorization: 'Bearer ' + TOKEN }
+    });
+    if (meR.ok) {
+      const me = await meR.json();
+      meId = me.id; meProduct = me.product; meEmail = me.email;
+    } else {
+      status.textContent = '❌ Token Spotify no válido para /me';
+      result.className = 'ma-pl-result err';
+      result.innerHTML = '<b>HTTP ' + meR.status + ' al pedir /me.</b><br>' +
+        'El token no es un user OAuth válido. Desconecta + reconecta. ' +
+        'Si persiste, revisa CLIENT_ID/SECRET en Streamlit Secrets.';
+      return;
+    }
+  } catch (e) {
+    status.textContent = '❌ Error de red al verificar /me';
+    result.className = 'ma-pl-result err';
+    result.innerHTML = '<b>Excepción al pedir /me:</b> ' + (e.message || 'desconocido');
+    return;
+  }
+
+  sub.textContent = `Token verificado · user=${meId} · email=${meEmail || '—'} · plan=${meProduct || '—'}`;
+  if (meId !== USER_ID) {
+    sub.textContent += ` · ⚠️ user_id streamlit (${USER_ID}) ≠ token (${meId}) → usando token`;
+  }
+
   status.textContent = `Resolviendo ${ISRCS.length.toLocaleString()} ISRCs en Spotify…`;
 
   for (let i = 0; i < ISRCS.length; i++) {
@@ -1315,7 +1344,8 @@ def render_client_side_playlist_creator(
   status.textContent = `Creando playlist con ${toAdd.length.toLocaleString()} tracks…`;
   let pl;
   try {
-    const r = await sFetch(`https://api.spotify.com/v1/users/${encodeURIComponent(USER_ID)}/playlists`, {
+    const createUid = meId || USER_ID;
+    const r = await sFetch(`https://api.spotify.com/v1/users/${encodeURIComponent(createUid)}/playlists`, {
       method: 'POST',
       body: JSON.stringify({ name: PL_NAME, description: PL_DESC, public: PL_PUB })
     });
