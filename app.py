@@ -1371,7 +1371,8 @@ def render_client_side_playlist_creator(
       }
       status.textContent = '❌ Error al crear playlist';
       result.className = 'ma-pl-result err';
-      result.innerHTML = '<b>HTTP ' + r.status + '</b>' + (reason ? ' — ' + reason : '') + '<br>' + hint;
+      const authedAs = `<div style="margin-top:0.6rem;padding:0.5rem;background:#f3f4f6;border-radius:6px;font-size:0.8rem;color:#374151;">Token autenticado como: <b>user_id=${meId || '?'}</b> · email=<b>${meEmail || '—'}</b> · plan=<b>${meProduct || '—'}</b><br>POST → /users/${encodeURIComponent(createUid)}/playlists</div>`;
+      result.innerHTML = '<b>HTTP ' + r.status + '</b>' + (reason ? ' — ' + reason : '') + '<br>' + hint + authedAs;
       return;
     }
     pl = await r.json();
