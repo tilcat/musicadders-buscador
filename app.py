@@ -45,7 +45,7 @@ import streamlit.components.v1 as components
 # CONSTANTES
 # ════════════════════════════════════════════════════════════════════════════
 MAX_BATCH_ISRCS = 500
-SPOTIFY_SCOPES = "playlist-modify-public playlist-modify-private user-read-private"
+SPOTIFY_SCOPES = "playlist-modify-public playlist-modify-private user-read-private user-read-email"
 
 
 # ════════════════════════════════════════════════════════════════════════════
