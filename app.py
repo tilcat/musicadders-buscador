@@ -621,7 +621,7 @@ def spotify_create_playlist(name: str, description: str = "", public: bool = Fal
     if not (tok and uid):
         return None
     r = requests.post(
-        f"{SP_API}/users/{uid}/playlists",
+        f"{SP_API}/me/playlists",
         headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"},
         json={"name": name, "description": description, "public": bool(public)},
         timeout=15,
@@ -643,7 +643,7 @@ def spotify_add_tracks(playlist_id: str, uris: list[str]) -> int:
         while True:
             attempts += 1
             r = sess.post(
-                f"{SP_API}/playlists/{playlist_id}/tracks",
+                f"{SP_API}/playlists/{playlist_id}/items",
                 headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"},
                 json={"uris": chunk},
                 timeout=20,
@@ -1344,8 +1344,7 @@ def render_client_side_playlist_creator(
   status.textContent = `Creando playlist con ${toAdd.length.toLocaleString()} tracks…`;
   let pl;
   try {
-    const createUid = meId || USER_ID;
-    const r = await sFetch(`https://api.spotify.com/v1/users/${encodeURIComponent(createUid)}/playlists`, {
+    const r = await sFetch(`https://api.spotify.com/v1/me/playlists`, {
       method: 'POST',
       body: JSON.stringify({ name: PL_NAME, description: PL_DESC, public: PL_PUB })
     });
@@ -1371,7 +1370,7 @@ def render_client_side_playlist_creator(
       }
       status.textContent = '❌ Error al crear playlist';
       result.className = 'ma-pl-result err';
-      const authedAs = `<div style="margin-top:0.6rem;padding:0.5rem;background:#f3f4f6;border-radius:6px;font-size:0.8rem;color:#374151;">Token autenticado como: <b>user_id=${meId || '?'}</b> · email=<b>${meEmail || '—'}</b> · plan=<b>${meProduct || '—'}</b><br>POST → /users/${encodeURIComponent(createUid)}/playlists</div>`;
+      const authedAs = `<div style="margin-top:0.6rem;padding:0.5rem;background:#f3f4f6;border-radius:6px;font-size:0.8rem;color:#374151;">Token autenticado como: <b>user_id=${meId || '?'}</b> · email=<b>${meEmail || '—'}</b> · plan=<b>${meProduct || '—'}</b><br>POST → /me/playlists</div>`;
       result.innerHTML = '<b>HTTP ' + r.status + '</b>' + (reason ? ' — ' + reason : '') + '<br>' + hint + authedAs;
       return;
     }
@@ -1388,7 +1387,7 @@ def render_client_side_playlist_creator(
     const chunk = toAdd.slice(i, i + 100);
     sub.textContent = `Añadiendo tracks ${(i + chunk.length).toLocaleString()} / ${toAdd.length.toLocaleString()}`;
     try {
-      const r = await sFetch(`https://api.spotify.com/v1/playlists/${pl.id}/tracks`, {
+      const r = await sFetch(`https://api.spotify.com/v1/playlists/${pl.id}/items`, {
         method: 'POST',
         body: JSON.stringify({ uris: chunk })
       });
