@@ -3,8 +3,7 @@
 3 modos:
   1. Búsqueda individual: pega 1 ISRC → placements en vivo.
   2. Procesado batch: sube Excel con hasta 500 ISRCs → tabla unificada.
-  3. Crear playlist Spotify: cada usuario conecta su Spotify (OAuth) y
-     crea playlist con los ISRCs encontrados.
+  3. Crear playlist Spotify usando una cuenta central configurada por el admin.
 
 Variables de entorno necesarias (Streamlit Cloud Secrets UI):
     SOUNDCHARTS_APP_ID = "..."
@@ -22,8 +21,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import html
 import io
 import json
+import logging
 import os
 import re
 import secrets as _secrets_mod
@@ -38,7 +39,6 @@ import bcrypt
 import pandas as pd
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -46,6 +46,21 @@ import streamlit.components.v1 as components
 # ════════════════════════════════════════════════════════════════════════════
 MAX_BATCH_ISRCS = 500
 SPOTIFY_SCOPES = "playlist-modify-public playlist-modify-private user-read-private user-read-email"
+# SPOTIFY_CENTRAL_MODE = True  # legacy flag, modo central es ahora obligatorio
+
+
+def _is_admin(user_email: str) -> bool:
+    """True si el email está en la lista SPOTIFY_CENTRAL_ADMINS de Secrets.
+    Si la lista no existe o está vacía, NADIE es admin (fail-closed)."""
+    admins = st.secrets.get("SPOTIFY_CENTRAL_ADMINS", [])
+    if isinstance(admins, str):
+        # Soporte de string CSV como fallback
+        admins = [a.strip().lower() for a in admins.split(",") if a.strip()]
+    elif isinstance(admins, (list, tuple)):
+        admins = [str(a).strip().lower() for a in admins if str(a).strip()]
+    else:
+        admins = []
+    return user_email.strip().lower() in admins
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -469,6 +484,87 @@ def spotify_client_credentials_token() -> str | None:
     return d["access_token"]
 
 
+def central_refresh_access_token() -> str | None:
+    """Renueva el access_token de la cuenta central usando el refresh_token
+    guardado en Streamlit Secrets como SPOTIFY_CENTRAL_REFRESH_TOKEN.
+    Devuelve el access_token o None si no hay refresh_token configurado
+    o el refresh falla."""
+    rt = st.secrets.get("SPOTIFY_CENTRAL_REFRESH_TOKEN", "").strip()
+    if not rt:
+        return None
+    cid = st.secrets.get("SPOTIFY_CLIENT_ID", "").strip()
+    cs = st.secrets.get("SPOTIFY_CLIENT_SECRET", "").strip()
+    if not (cid and cs):
+        return None
+    auth = base64.b64encode(f"{cid}:{cs}".encode()).decode()
+    try:
+        r = requests.post(
+            SP_TOKEN_URL,
+            headers={"Authorization": f"Basic {auth}",
+                     "Content-Type": "application/x-www-form-urlencoded"},
+            data={"grant_type": "refresh_token", "refresh_token": rt},
+            timeout=15,
+        )
+    except requests.exceptions.RequestException:
+        return None
+    if r.status_code != 200:
+        return None
+    d = r.json()
+    st.session_state.spotify_central_access_token = d["access_token"]
+    st.session_state.spotify_central_token_expires = time.time() + int(d.get("expires_in", 3600))
+    new_rt = d.get("refresh_token")
+    if new_rt and new_rt != rt:
+        # Spotify ha rotado el refresh_token. Aviso al admin.
+        if _is_admin(st.session_state.get("user_email", "")):
+            st.warning(
+                f"⚠️ Spotify rotó el refresh_token central. Actualiza en Streamlit Secrets:\n\n"
+                f"`SPOTIFY_CENTRAL_REFRESH_TOKEN = \"{new_rt}\"`\n\n"
+                "El token actual sigue activo pero puede caducar pronto."
+            )
+        logging.warning("Spotify rotated central refresh_token. Admin must update Streamlit Secrets.")
+    return d["access_token"]
+
+
+def central_get_access_token() -> str | None:
+    """Devuelve un access_token válido de la cuenta central, renovando si caducó."""
+    at = st.session_state.get("spotify_central_access_token")
+    exp = st.session_state.get("spotify_central_token_expires", 0)
+    if at and time.time() < exp - 60:
+        return at
+    return central_refresh_access_token()
+
+
+def central_user_info() -> dict | None:
+    """Llama /me con el token central y cachea {id, display_name, email}.
+    Devuelve dict o None si no hay token central."""
+    if st.session_state.get("spotify_central_user_id"):
+        return {
+            "id": st.session_state.spotify_central_user_id,
+            "display_name": st.session_state.get("spotify_central_display_name", ""),
+            "email": st.session_state.get("spotify_central_email", ""),
+        }
+    tok = central_get_access_token()
+    if not tok:
+        return None
+    r = requests.get(f"{SP_API}/me", headers={"Authorization": f"Bearer {tok}"}, timeout=15)
+    if r.status_code != 200:
+        return None
+    me = r.json()
+    expected_id = str(st.secrets.get("SPOTIFY_CENTRAL_EXPECTED_USER_ID", "")).strip()
+    if expected_id and me.get("id") != expected_id:
+        # Cuenta central sustituida en Secrets sin permiso. Abortar.
+        logging.error(f"CENTRAL ACCOUNT MISMATCH: expected={expected_id}, got={me.get('id')}")
+        return None
+    st.session_state.spotify_central_user_id = me.get("id")
+    st.session_state.spotify_central_display_name = me.get("display_name") or me.get("id")
+    st.session_state.spotify_central_email = me.get("email", "")
+    return {
+        "id": st.session_state.spotify_central_user_id,
+        "display_name": st.session_state.spotify_central_display_name,
+        "email": st.session_state.spotify_central_email,
+    }
+
+
 def spotify_find_uri_by_isrc(isrc: str) -> str | None:
     tok = spotify_get_token()
     if not tok:
@@ -616,9 +712,8 @@ def spotify_resolve_isrcs(isrcs: list[str], progress_cb=None,
 
 
 def spotify_create_playlist(name: str, description: str = "", public: bool = False) -> dict | None:
-    tok = spotify_get_token()
-    uid = spotify_user_id()
-    if not (tok and uid):
+    tok = central_get_access_token()
+    if not tok:
         return None
     r = requests.post(
         f"{SP_API}/me/playlists",
@@ -626,53 +721,25 @@ def spotify_create_playlist(name: str, description: str = "", public: bool = Fal
         json={"name": name, "description": description, "public": bool(public)},
         timeout=15,
     )
-    if r.status_code != 201:
+    if r.status_code == 401:
+        new_tok = central_refresh_access_token()
+        if new_tok:
+            tok = new_tok
+            r = requests.post(
+                f"{SP_API}/me/playlists",
+                headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"},
+                json={"name": name, "description": description, "public": bool(public)},
+                timeout=15,
+            )
+    if r.status_code not in (200, 201):
         return None
     return r.json()
 
 
-def spotify_add_tracks(playlist_id: str, uris: list[str]) -> int:
-    tok = spotify_get_token()
-    if not tok:
-        return 0
-    sess = requests.Session()
-    added = 0
-    for i in range(0, len(uris), 100):
-        chunk = uris[i:i+100]
-        attempts = 0
-        while True:
-            attempts += 1
-            r = sess.post(
-                f"{SP_API}/playlists/{playlist_id}/items",
-                headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"},
-                json={"uris": chunk},
-                timeout=20,
-            )
-            if r.status_code in (200, 201):
-                added += len(chunk)
-                break
-            if r.status_code == 401 and attempts == 1:
-                new_tok = spotify_refresh_access_token()
-                if not new_tok:
-                    return added
-                tok = new_tok
-                continue
-            if r.status_code == 429 and attempts <= 3:
-                ra = r.headers.get("Retry-After")
-                try:
-                    wait = min(int(ra), 30) if ra else 5
-                except ValueError:
-                    wait = 5
-                time.sleep(wait)
-                continue
-            break
-    return added
-
-
 def handle_spotify_callback():
-    """Si la URL trae ?code=...&state=..., intercambia y guarda el refresh_token.
-    Si Streamlit perdió la sesión durante el round-trip OAuth (cookies cross-site),
-    restaura user_email desde el state firmado. Limpia query params al final."""
+    """Procesa el callback OAuth de Spotify. Valida HMAC del state para CSRF.
+    Si la sesión está vacía, aborta con error y exige re-login — la identidad
+    NUNCA se reconstruye desde el state. Limpia query params al final."""
     qp = st.query_params
     code = qp.get("code")
     state = qp.get("state")
@@ -689,10 +756,24 @@ def handle_spotify_callback():
         st.query_params.clear()
         return
 
-    # Restaurar sesión de usuario si se perdió (cookies SameSite cross-site)
-    if payload and not st.session_state.get("user_email") and payload.get("u"):
-        st.session_state.user_email = payload["u"]
-        st.session_state.login_at = datetime.now(timezone.utc).isoformat()
+    # La identidad solo puede provenir del login bcrypt, NUNCA del state OAuth.
+    # Si la sesión se perdió durante el round-trip, abortar y exigir re-login.
+    session_email = st.session_state.get("user_email", "")
+    if not session_email:
+        st.error(
+            "🔒 Tu sesión expiró durante la autorización Spotify. "
+            "Vuelve a iniciar sesión y reintenta el setup."
+        )
+        st.query_params.clear()
+        st.session_state.pop("spotify_oauth_state", None)
+        st.stop()
+
+    # Si el state HMAC trae un email, debe coincidir con la sesión actual.
+    if payload and payload.get("u") and payload["u"].strip().lower() != session_email.strip().lower():
+        st.error("🔒 Inconsistencia OAuth: el state no corresponde a tu sesión.")
+        st.query_params.clear()
+        st.session_state.pop("spotify_oauth_state", None)
+        st.stop()
 
     data = spotify_exchange_code(code)
     if data:
@@ -1124,293 +1205,6 @@ def show_batch_result():
         "pestaña **🎵 Crear playlist Spotify**."
     )
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# COMPONENTE CLIENT-SIDE: resolución + creación de playlist en el navegador.
-# Streamlit Cloud (servidor) tiene latencia alta y rate-limit con Spotify;
-# correr en el navegador del usuario es 10-50× más rápido (igual que
-# playlisttracker-v2).
-# ════════════════════════════════════════════════════════════════════════════
-def render_client_side_playlist_creator(
-    *, access_token: str, user_id: str, isrcs: list[str],
-    name: str, desc: str, public: bool,
-) -> None:
-    """Inyecta un iframe que hace toda la resolución + creación en el navegador."""
-    payload = {
-        "token": access_token,
-        "userId": user_id,
-        "isrcs": isrcs,
-        "name": name,
-        "desc": desc,
-        "public": bool(public),
-    }
-    payload_json = json.dumps(payload)
-
-    html = """
-<style>
-  .ma-pl-wrap {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    padding: 1.2rem 1.4rem;
-    background: #f9fafb;
-    border-radius: 12px;
-    border: 1px solid #e5e7eb;
-  }
-  .ma-pl-status { font-size: 0.95rem; color: #111827; margin-bottom: 0.4rem; font-weight: 600; }
-  .ma-pl-sub { font-size: 0.85rem; color: #6b7280; margin-bottom: 0.6rem; }
-  .ma-pl-bar { background: #e5e7eb; height: 10px; border-radius: 5px; overflow: hidden; margin: 0.6rem 0; }
-  .ma-pl-bar-fill { background: linear-gradient(90deg, #1ED760, #06B6D4); height: 100%; transition: width 0.25s; width: 0%; }
-  .ma-pl-counts { display: flex; gap: 1.2rem; font-size: 0.9rem; margin: 0.7rem 0; }
-  .ma-pl-counts b { display: block; font-size: 1.4rem; font-weight: 700; }
-  .ma-pl-counts .ok b { color: #16a34a; }
-  .ma-pl-counts .nf b { color: #6b7280; }
-  .ma-pl-counts .er b { color: #ef4444; }
-  .ma-pl-result { background: white; border-left: 4px solid #1ED760; padding: 1.1rem 1.3rem; margin-top: 1rem; border-radius: 8px; }
-  .ma-pl-result.err { border-left-color: #ef4444; }
-  .ma-pl-link {
-    display: inline-block; margin-top: 0.6rem;
-    color: white; background: #1ED760; padding: 0.6rem 1.2rem;
-    border-radius: 24px; font-weight: 700; text-decoration: none;
-  }
-  .ma-pl-link:hover { background: #19b452; }
-</style>
-<div class="ma-pl-wrap">
-  <div id="ma-status" class="ma-pl-status">Preparando…</div>
-  <div id="ma-sub" class="ma-pl-sub"></div>
-  <div class="ma-pl-bar"><div id="ma-bar" class="ma-pl-bar-fill"></div></div>
-  <div class="ma-pl-counts">
-    <div class="ok"><b id="ma-ok">0</b><span>encontrados</span></div>
-    <div class="nf"><b id="ma-nf">0</b><span>no en Spotify</span></div>
-    <div class="er"><b id="ma-er">0</b><span>errores</span></div>
-  </div>
-  <div id="ma-result"></div>
-</div>
-<script>
-(async () => {
-  const P = __PAYLOAD__;
-  let TOKEN = P.token;
-  const USER_ID = P.userId;
-  const ISRCS = P.isrcs;
-  const PL_NAME = P.name;
-  const PL_DESC = P.desc;
-  const PL_PUB = P.public;
-
-  const $ = id => document.getElementById(id);
-  const status = $('ma-status'), sub = $('ma-sub'), bar = $('ma-bar');
-  const okEl = $('ma-ok'), nfEl = $('ma-nf'), erEl = $('ma-er'), result = $('ma-result');
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-  // Throttle adaptativo: 0ms al empezar; sube en 429, baja en éxito.
-  let interReqDelay = 0;
-  const MAX_DELAY = 2000, MIN_DELAY = 0;
-
-  async function sFetch(url, opts = {}, maxRetries = 6) {
-    if (interReqDelay > 0) await sleep(interReqDelay);
-    let attempts = 0;
-    while (true) {
-      attempts++;
-      let r;
-      try {
-        r = await fetch(url, {
-          ...opts,
-          headers: { Authorization: 'Bearer ' + TOKEN, 'Content-Type': 'application/json', ...(opts.headers || {}) }
-        });
-      } catch (e) {
-        if (attempts < 3) { await sleep(500); continue; }
-        throw e;
-      }
-      if (r.status === 429 && attempts < maxRetries) {
-        const w = Math.min(Number(r.headers.get('Retry-After') || 2) + 1, 30);
-        // AIMD: aumento agresivo del delay en 429
-        interReqDelay = Math.min(MAX_DELAY, Math.max(interReqDelay * 2, 250));
-        sub.textContent = `Rate limit · esperando ${w}s · throttle ${interReqDelay}ms (intento ${attempts}/${maxRetries})`;
-        await sleep(w * 1000);
-        continue;
-      }
-      // Éxito: reducción suave del delay (decremento lineal)
-      if (r.ok && interReqDelay > MIN_DELAY) {
-        interReqDelay = Math.max(MIN_DELAY, interReqDelay - 5);
-      }
-      return r;
-    }
-  }
-
-  const uris = [];
-  const notFound = [];
-  const errors = [];
-  const errorByCode = {};  // histograma de códigos HTTP
-  let tokenExpired = false;
-  const t0 = performance.now();
-
-  // Diagnóstico inicial: confirmar identidad del token antes de procesar.
-  let meId = null, meProduct = null, meEmail = null;
-  try {
-    const meR = await fetch('https://api.spotify.com/v1/me', {
-      headers: { Authorization: 'Bearer ' + TOKEN }
-    });
-    if (meR.ok) {
-      const me = await meR.json();
-      meId = me.id; meProduct = me.product; meEmail = me.email;
-    } else {
-      status.textContent = '❌ Token Spotify no válido para /me';
-      result.className = 'ma-pl-result err';
-      result.innerHTML = '<b>HTTP ' + meR.status + ' al pedir /me.</b><br>' +
-        'El token no es un user OAuth válido. Desconecta + reconecta. ' +
-        'Si persiste, revisa CLIENT_ID/SECRET en Streamlit Secrets.';
-      return;
-    }
-  } catch (e) {
-    status.textContent = '❌ Error de red al verificar /me';
-    result.className = 'ma-pl-result err';
-    result.innerHTML = '<b>Excepción al pedir /me:</b> ' + (e.message || 'desconocido');
-    return;
-  }
-
-  sub.textContent = `Token verificado · user=${meId} · email=${meEmail || '—'} · plan=${meProduct || '—'}`;
-  if (meId !== USER_ID) {
-    sub.textContent += ` · ⚠️ user_id streamlit (${USER_ID}) ≠ token (${meId}) → usando token`;
-  }
-
-  status.textContent = `Resolviendo ${ISRCS.length.toLocaleString()} ISRCs en Spotify…`;
-
-  for (let i = 0; i < ISRCS.length; i++) {
-    const isrc = ISRCS[i];
-    try {
-      const r = await sFetch(`https://api.spotify.com/v1/search?q=isrc:${encodeURIComponent(isrc)}&type=track&limit=1`);
-      if (r.ok) {
-        const d = await r.json();
-        const items = (d && d.tracks && d.tracks.items) || [];
-        if (items.length) uris.push(items[0].uri);
-        else notFound.push(isrc);
-      } else {
-        errors.push(isrc + ' (http ' + r.status + ')');
-        errorByCode[r.status] = (errorByCode[r.status] || 0) + 1;
-        if (r.status === 401) {
-          tokenExpired = true;
-          console.error('Token Spotify expirado (HTTP 401). Abortando.');
-          break;
-        }
-        if (r.status === 403) {
-          // Insufficient scope o app sin permiso — abortar inmediato
-          console.error('HTTP 403 — la app no tiene permiso. Body:', await r.text().catch(() => ''));
-          break;
-        }
-      }
-    } catch (e) {
-      const m = e.message || 'error';
-      errors.push(isrc + ' (' + m + ')');
-      errorByCode['net'] = (errorByCode['net'] || 0) + 1;
-    }
-
-    if (i % 10 === 0 || i === ISRCS.length - 1) {
-      const done = i + 1;
-      const pct = (done / ISRCS.length) * 100;
-      bar.style.width = pct + '%';
-      const el = (performance.now() - t0) / 1000;
-      const rate = done / Math.max(el, 0.1);
-      const eta = Math.round((ISRCS.length - done) / Math.max(rate, 0.1));
-      const codes = Object.entries(errorByCode).map(([k,v]) => k+':'+v).join(' ');
-      sub.textContent = `${done.toLocaleString()} / ${ISRCS.length.toLocaleString()} · ${rate.toFixed(1)}/s · ETA ${eta}s · throttle ${interReqDelay}ms` + (codes ? ` · errores [${codes}]` : '');
-      okEl.textContent = uris.length.toLocaleString();
-      nfEl.textContent = notFound.length.toLocaleString();
-      erEl.textContent = errors.length.toLocaleString();
-    }
-  }
-
-  if (tokenExpired) {
-    status.textContent = '🔑 Token Spotify expirado';
-    result.className = 'ma-pl-result err';
-    result.innerHTML = '<b>El token Spotify ha caducado durante el proceso.</b><br>' +
-      'Recarga la página (Cmd+R) y vuelve a lanzar — al renovar el token tendrás otra hora completa.';
-    return;
-  }
-
-  const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
-  bar.style.width = '100%';
-  sub.textContent = `Resolución completada en ${elapsed}s.`;
-
-  if (!uris.length) {
-    status.textContent = '❌ Sin tracks que añadir';
-    result.className = 'ma-pl-result err';
-    result.innerHTML = '<b>Ningún ISRC resolvió a un track Spotify.</b><br>'
-      + 'Revisa que estos ISRCs estén distribuidos en Spotify, o que el token siga vigente.';
-    return;
-  }
-
-  const toAdd = uris.slice(0, 10000);
-  if (uris.length > 10000) {
-    sub.textContent += ` · recortado a 10.000 (límite Spotify por playlist)`;
-  }
-
-  status.textContent = `Creando playlist con ${toAdd.length.toLocaleString()} tracks…`;
-  let pl;
-  try {
-    const r = await sFetch(`https://api.spotify.com/v1/me/playlists`, {
-      method: 'POST',
-      body: JSON.stringify({ name: PL_NAME, description: PL_DESC, public: PL_PUB })
-    });
-    if (!r.ok) {
-      const bodyText = await r.text().catch(() => '');
-      let reason = '';
-      let hint = '';
-      try {
-        const j = JSON.parse(bodyText);
-        reason = (j.error && (j.error.message || j.error.reason)) || '';
-      } catch { reason = bodyText.slice(0, 200); }
-      if (r.status === 403) {
-        const low = (reason || '').toLowerCase();
-        if (low.includes('scope') || low.includes('insufficient')) {
-          hint = 'El token no tiene scope <code>playlist-modify-public</code>/<code>playlist-modify-private</code>. Pulsa 🔌 Desconectar y vuelve a conectar para forzar el scope correcto.';
-        } else {
-          hint = 'Causa probable: tu cuenta no está en <b>User Management</b> de la app Spotify configurada (Development Mode). Ve a developer.spotify.com → tu app → User Management → añade tu email exacto de Spotify. Alternativa: pulsa 🔌 Desconectar y reconecta por si era token viejo cacheado.';
-        }
-      } else if (r.status === 401) {
-        hint = 'Token caducado. Recarga la página y reconecta.';
-      } else {
-        hint = (reason || 'sin detalle');
-      }
-      status.textContent = '❌ Error al crear playlist';
-      result.className = 'ma-pl-result err';
-      const authedAs = `<div style="margin-top:0.6rem;padding:0.5rem;background:#f3f4f6;border-radius:6px;font-size:0.8rem;color:#374151;">Token autenticado como: <b>user_id=${meId || '?'}</b> · email=<b>${meEmail || '—'}</b> · plan=<b>${meProduct || '—'}</b><br>POST → /me/playlists</div>`;
-      result.innerHTML = '<b>HTTP ' + r.status + '</b>' + (reason ? ' — ' + reason : '') + '<br>' + hint + authedAs;
-      return;
-    }
-    pl = await r.json();
-  } catch (e) {
-    status.textContent = '❌ Error al crear playlist';
-    result.className = 'ma-pl-result err';
-    result.innerHTML = '<b>No se pudo crear la playlist:</b> ' + (e.message || 'error desconocido');
-    return;
-  }
-
-  let added = 0;
-  for (let i = 0; i < toAdd.length; i += 100) {
-    const chunk = toAdd.slice(i, i + 100);
-    sub.textContent = `Añadiendo tracks ${(i + chunk.length).toLocaleString()} / ${toAdd.length.toLocaleString()}`;
-    try {
-      const r = await sFetch(`https://api.spotify.com/v1/playlists/${pl.id}/items`, {
-        method: 'POST',
-        body: JSON.stringify({ uris: chunk })
-      });
-      if (r.ok) added += chunk.length;
-    } catch (e) { /* sigue */ }
-  }
-
-  status.textContent = '✅ Playlist creada';
-  sub.textContent = `Tiempo total: ${((performance.now() - t0) / 1000).toFixed(1)}s`;
-  const url = (pl.external_urls && pl.external_urls.spotify) || '#';
-  result.className = 'ma-pl-result';
-  result.innerHTML = `
-    <div style="font-size:1rem;margin-bottom:0.3rem;"><b>${added.toLocaleString()} tracks añadidos</b> de ${ISRCS.length.toLocaleString()} ISRCs.</div>
-    <div style="font-size:0.85rem;color:#6b7280;">${notFound.length.toLocaleString()} no en Spotify · ${errors.length.toLocaleString()} errores.</div>
-    <a class="ma-pl-link" href="${url}" target="_blank">Abrir en Spotify →</a>
-  `;
-})();
-</script>
-"""
-    html = html.replace("__PAYLOAD__", payload_json)
-    components.html(html, height=440, scrolling=False)
-
-
 def tab_playlist():
     """Tab 3 — crear playlist Spotify con los ISRCs del batch (o pegados a mano)."""
     cid = st.secrets.get("SPOTIFY_CLIENT_ID", "").strip()
@@ -1423,48 +1217,117 @@ def tab_playlist():
         )
         return
 
-    # Conexión Spotify del usuario
-    if not st.session_state.get("spotify_refresh_token"):
-        url = spotify_login_url()
+    _tab_playlist_central()
+
+
+def _tab_playlist_central():
+    """Modo central: todas las playlists se crean en la cuenta Spotify configurada."""
+    has_central_token = bool(
+        str(st.secrets.get("SPOTIFY_CENTRAL_REFRESH_TOKEN", "") or "").strip()
+    )
+
+    if not has_central_token:
+        # --- PANTALLA DE SETUP ---
+        if not _is_admin(st.session_state.get("user_email", "")):
+            st.error(
+                "🔒 La cuenta central Spotify no está configurada. "
+                "Esta configuración solo puede realizarla un administrador. "
+                "Contacta a Victor (victor.gimenez@musicadders.com) para que regenere el token."
+            )
+            return
+
+        st.markdown("### 🔧 Configurar cuenta central Spotify")
         st.markdown(
-            "Para crear playlists necesitas conectar tu cuenta Spotify (1 sola vez):"
+            "Esta app crea playlists en una cuenta Spotify central única. "
+            "Para activarla, conecta esa cuenta una sola vez: se generará un "
+            "`refresh_token` que pegarás en Streamlit Secrets."
         )
-        # st.link_button abre en la misma pestaña (preferible para OAuth):
-        # mantiene la sesión y al volver con ?code= se procesa automáticamente.
-        st.link_button("🎵 Conectar mi cuenta Spotify", url, type="primary")
-        st.caption(
-            "Te llevará a Spotify para autorizar. Tras autorizar volverás aquí y verás "
-            "confirmación. Si tu navegador tiene bloqueador (uBlock, Brave Shields, "
-            "AdBlock…) que bloquea accounts.spotify.com, **whitelistéalo** o usa "
-            "modo incógnito **abriendo esta URL ahí**: " + (st.secrets.get("APP_BASE_URL", "") or "")
-        )
-        with st.expander("¿No se abre? Copia este link y pégalo en el navegador"):
-            st.code(url, language=None)
+
+        expected_id = str(st.secrets.get("SPOTIFY_CENTRAL_EXPECTED_USER_ID", "")).strip()
+        if not expected_id:
+            st.error(
+                "🔒 Falta configurar `SPOTIFY_CENTRAL_EXPECTED_USER_ID` en Streamlit Secrets. "
+                "Es obligatorio antes de capturar el refresh_token. "
+                "Añade el Spotify user_id de la cuenta central esperada (lo encuentras en https://open.spotify.com/account) "
+                "y reinicia la app."
+            )
+            return
+
+        # Si el callback OAuth ya se procesó en esta sesión, mostramos el token capturado.
+        captured_rt = st.session_state.get("spotify_refresh_token")
+        if captured_rt:
+            # Intentar mostrar a quién pertenece el token (usando helpers per-user
+            # que ya tienen el access_token en sesión)
+            uid = spotify_user_id()
+            display = st.session_state.get("spotify_display_name") or uid or "—"
+            email = ""
+            if uid:
+                r = requests.get(
+                    f"{SP_API}/me",
+                    headers={"Authorization": f"Bearer {st.session_state.get('spotify_access_token', '')}"},
+                    timeout=15,
+                )
+                if r.status_code == 200:
+                    email = r.json().get("email", "")
+
+            authorized_id = uid or ""
+            expected_id = str(st.secrets.get("SPOTIFY_CENTRAL_EXPECTED_USER_ID", "")).strip()
+            if expected_id and authorized_id != expected_id:
+                st.error(
+                    f"❌ Cuenta autorizada incorrecta. Se esperaba `{expected_id}`, autorizaste `{authorized_id}`. "
+                    "Revoca el acceso en https://www.spotify.com/account/apps y reintenta con la cuenta correcta."
+                )
+                for k in ("spotify_refresh_token", "spotify_access_token", "spotify_token_expires",
+                          "spotify_user_id", "spotify_display_name"):
+                    st.session_state.pop(k, None)
+                return
+
+            st.success(f"✅ OAuth completado con cuenta: {display}" + (f" ({email})" if email else ""))
+            st.markdown("**Copia este refresh_token exactamente:**")
+            st.code(captured_rt, language=None)
+            if not expected_id:
+                st.caption(
+                    f'⚠️ Primera configuración: añade también `SPOTIFY_CENTRAL_EXPECTED_USER_ID = "{authorized_id}"` '
+                    "a Secrets para que futuros setups se validen automáticamente."
+                )
+            st.markdown(
+                "**Próximos pasos:**\n"
+                "1. Entra a https://share.streamlit.io\n"
+                "2. Tu app → Settings → Secrets\n"
+                "3. Añade: `SPOTIFY_CENTRAL_REFRESH_TOKEN = \"valor_pegado\"`\n"
+                "4. La app reinicia automáticamente en ~60s\n"
+                "5. Vuelve a este tab y verás el encabezado verde con el nombre de la cuenta Spotify central"
+            )
+            # Estado terminal: no continuar al flujo de creación
+            return
+
+        # Aún no hay OAuth completado: mostrar botón de conexión
+        url = spotify_login_url()
+        if url:
+            st.link_button("Conectar cuenta central Spotify", url, type="primary")
+            with st.expander("¿No se abre? Copia este link y pégalo en el navegador"):
+                st.code(url, language=None)
+        else:
+            st.error("No se pudo generar la URL OAuth. Verifica SPOTIFY_CLIENT_ID en Secrets.")
         return
 
-    # Ya conectado
-    uid = spotify_user_id()
-    if not uid:
-        st.warning("Token Spotify caducado. Vuelve a conectar.")
-        if st.button("🔁 Reconectar Spotify"):
-            for k in ("spotify_refresh_token", "spotify_access_token",
-                      "spotify_token_expires", "spotify_user_id", "spotify_display_name"):
-                st.session_state.pop(k, None)
-            st.rerun()
+    # --- FLUJO NORMAL: cuenta central configurada ---
+    info = central_user_info()
+    if info:
+        display_name = info.get("display_name") or info.get("id") or "cuenta central"
+        st.success(
+            f"✅ Cuenta central: **{display_name}** — las playlists se crearán aquí "
+            f"y serán accesibles para todo el equipo."
+        )
+    else:
+        st.warning(
+            "No se pudo verificar la cuenta central. "
+            "El token puede haber expirado o ser inválido. "
+            "Contacta al administrador para regenerar SPOTIFY_CENTRAL_REFRESH_TOKEN."
+        )
         return
 
-    display = st.session_state.get("spotify_display_name") or uid
-    col_s1, col_s2 = st.columns([4, 1])
-    with col_s1:
-        st.success(f"✅ Spotify conectado: **{display}**")
-    with col_s2:
-        if st.button("🔌 Desconectar"):
-            for k in ("spotify_refresh_token", "spotify_access_token",
-                      "spotify_token_expires", "spotify_user_id", "spotify_display_name"):
-                st.session_state.pop(k, None)
-            st.rerun()
-
-    # Fuente de ISRCs: batch reciente, subir Excel o pegar a mano
+    # Fuente de ISRCs
     st.markdown("##### Fuente de ISRCs")
     source = st.radio(
         "Origen",
@@ -1479,7 +1342,6 @@ def tab_playlist():
                 "📊 Procesar Excel, o usa 'Subir Excel' / 'Pegar lista manual'."
             )
             return
-        # Filtrar a los que SÍ se resolvieron en Soundcharts
         meta = (st.session_state.get("batch_result") or {}).get("meta") or {}
         isrcs = [i for i in batch_isrcs if i in meta]
         st.caption(f"Usando {len(isrcs)} ISRCs del último batch (los que Soundcharts resolvió).")
@@ -1523,7 +1385,7 @@ def tab_playlist():
                                  value=f"Creada desde el buscador Musicadders · {len(isrcs)} ISRCs")
     with col_p:
         pl_public = st.checkbox("Pública", value=False,
-                                help="Si NO la marcas, será privada en tu cuenta Spotify.")
+                                help="Si NO la marcas, será privada en la cuenta Spotify central.")
         create_btn = st.button("🎵 Crear playlist", type="primary", width="stretch")
 
     if not create_btn:
@@ -1532,28 +1394,140 @@ def tab_playlist():
         st.error("Pon un nombre a la playlist.")
         return
 
-    # Garantizar token válido y user_id antes de lanzar el componente
-    access_token = spotify_get_token()
-    user_id = spotify_user_id()
-    if not (access_token and user_id):
-        st.error("Token Spotify no disponible. Vuelve a conectar tu cuenta.")
+    # Resolución de ISRCs server-side (Client Credentials)
+    prog_bar = st.progress(0.0, text="Resolviendo ISRCs en Spotify...")
+
+    def _progress_cb(done, total, summary):
+        prog_bar.progress(done / max(total, 1), text=f"{done}/{total} — {summary}")
+
+    with st.spinner("Resolviendo ISRCs en Spotify..."):
+        resolve_result = spotify_resolve_isrcs(isrcs, progress_cb=_progress_cb)
+
+    prog_bar.empty()
+
+    uris = resolve_result.get("uris", [])
+    not_found = resolve_result.get("not_found", [])
+    errors = resolve_result.get("errors", [])
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Encontrados en Spotify", len(uris))
+    c2.metric("No en Spotify", len(not_found))
+    c3.metric("Errores", len(errors))
+
+    if resolve_result.get("stopped"):
+        st.error(f"Resolución abortada: {resolve_result.get('reason', '')}")
         return
 
-    st.divider()
-    st.markdown("##### Creando playlist en tu navegador")
-    st.caption(
-        "La búsqueda y la creación corren localmente en tu navegador "
-        "(no en el servidor) — mucho más rápido y sin errores 429."
-    )
-    render_client_side_playlist_creator(
-        access_token=access_token,
-        user_id=user_id,
-        isrcs=isrcs,
-        name=pl_name.strip(),
-        desc=pl_desc.strip(),
-        public=pl_public,
-    )
+    if not uris:
+        st.warning("Ningún ISRC resolvió a un track Spotify. Revisa que los ISRCs estén distribuidos.")
+        return
 
+    # Creación de playlist server-side (token central)
+    with st.spinner("Creando playlist en la cuenta central..."):
+        pl = spotify_create_playlist(pl_name.strip(), pl_desc.strip(), pl_public)
+
+    if pl is None:
+        tok_check = central_get_access_token()
+        if not tok_check:
+            st.error(
+                "Error 401: el token central ha expirado o es inválido. "
+                "Regenera SPOTIFY_CENTRAL_REFRESH_TOKEN en Streamlit Secrets."
+            )
+        else:
+            st.error(
+                "No se pudo crear la playlist (error desconocido). "
+                "Puede ser un 403 (permisos) o un problema temporal. Inténtalo de nuevo."
+            )
+        return
+
+    playlist_id = pl.get("id")
+    if not playlist_id:
+        st.error("Spotify devolvió respuesta inesperada al crear la playlist.")
+        return
+
+    # Añadir tracks por chunks de 100
+    total_uris = uris[:10000]  # límite Spotify
+    chunks_total = (len(total_uris) + 99) // 100
+    add_prog = st.progress(0.0, text="Añadiendo tracks...")
+    added = 0
+    sess = requests.Session()
+
+    tok_add = central_get_access_token()
+    if not tok_add:
+        st.error("Token central no disponible para añadir tracks.")
+        return
+
+    _fatal_error = None
+    for chunk_idx, i in enumerate(range(0, len(total_uris), 100)):
+        chunk = total_uris[i:i + 100]
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                r = sess.post(
+                    f"{SP_API}/playlists/{playlist_id}/items",
+                    headers={"Authorization": f"Bearer {tok_add}", "Content-Type": "application/json"},
+                    json={"uris": chunk},
+                    timeout=20,
+                )
+            except requests.exceptions.RequestException as exc:
+                _fatal_error = (
+                    f"Error de red al añadir canciones en chunk {chunk_idx}/{chunks_total}: "
+                    f"{exc.__class__.__name__}. La playlist quedó incompleta."
+                )
+                break
+            if r.status_code in (200, 201):
+                added += len(chunk)
+                break
+            if r.status_code == 401 and attempts == 1:
+                new_tok = central_refresh_access_token()
+                if not new_tok:
+                    _fatal_error = "401 — token central expiró sin posibilidad de renovación. Regenera SPOTIFY_CENTRAL_REFRESH_TOKEN."
+                    break
+                tok_add = new_tok
+                continue
+            if r.status_code == 401:
+                _fatal_error = f"401 persistente en chunk {chunk_idx}/{chunks_total} tras refresh."
+                break
+            if r.status_code == 403:
+                _fatal_error = "403 — la cuenta central no tiene permisos suficientes para añadir tracks."
+                break
+            if r.status_code == 429 and attempts <= 3:
+                ra = r.headers.get("Retry-After")
+                try:
+                    wait = min(int(ra), 30) if ra else 5
+                except ValueError:
+                    wait = 5
+                time.sleep(wait)
+                continue
+            if r.status_code == 429:
+                _fatal_error = f"429 persistente en chunk {chunk_idx}/{chunks_total} tras {attempts} intentos."
+                break
+            # Cualquier otro código (5xx, etc.)
+            _fatal_error = (
+                f"add-tracks falló HTTP {r.status_code} en chunk {chunk_idx}/{chunks_total} "
+                f"tras {attempts} intentos."
+            )
+            break
+        add_prog.progress((chunk_idx + 1) / chunks_total,
+                          text=f"Añadidos {added:,} / {len(total_uris):,} tracks")
+        if _fatal_error:
+            add_prog.empty()
+            pl_url = (pl.get("external_urls") or {}).get("spotify") or ""
+            link_md = f" [Abrir en Spotify]({pl_url})" if pl_url else ""
+            st.warning(
+                f"⚠️ Playlist creada PARCIAL: se añadieron {added:,} de {len(total_uris):,} tracks. "
+                f"Causa: {_fatal_error}.{link_md}"
+            )
+            return
+
+    add_prog.empty()
+
+    pl_url = (pl.get("external_urls") or {}).get("spotify") or ""
+    st.success(f"Playlist creada con {added:,} tracks.")
+    if pl_url:
+        st.link_button("Abrir en Spotify", pl_url, type="primary")
+    st.caption(f"La playlist está en la cuenta Spotify central del equipo (**{display_name}**), no en tu cuenta personal.")
 
 def main_view():
     user = st.session_state.user_email
@@ -1565,7 +1539,7 @@ def main_view():
             f"""
 <div class='ma-header'>
   <h1>🎵 Buscador de placements</h1>
-  <div class='sub'>Hola, <b>{user}</b></div>
+  <div class='sub'>Hola, <b>{html.escape(user)}</b></div>
 </div>
 """,
             unsafe_allow_html=True,
@@ -1593,9 +1567,9 @@ def main_view():
 # ════════════════════════════════════════════════════════════════════════════
 # Entry point
 # ════════════════════════════════════════════════════════════════════════════
-# Procesar callback Spotify ANTES de decidir login vs main: si la sesión
-# Streamlit se perdió durante el round-trip OAuth, handle_spotify_callback()
-# restaura user_email desde el state firmado.
+# Procesar callback Spotify ANTES de decidir login vs main.
+# Si la sesión se perdió durante el round-trip OAuth, se aborta con error —
+# user_email NUNCA se restaura desde el state.
 handle_spotify_callback()
 
 if "user_email" not in st.session_state:
