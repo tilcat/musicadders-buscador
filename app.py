@@ -937,7 +937,7 @@ def tab_individual():
     with col_refresh:
         if st.button("🔄 Refrescar", width="stretch",
                      help="Ignora cache y consulta Soundcharts ahora."):
-            st.session_state.cache_buster = str(time.time())
+            st.cache_data.clear()
             st.rerun()
 
     platforms = _platforms_for_scope(scope)
