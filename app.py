@@ -1540,6 +1540,68 @@ def _tab_playlist_central():
         st.link_button("Abrir en Spotify", pl_url, type="primary")
     st.caption(f"La playlist está en la cuenta Spotify central del equipo (**{display_name}**), no en tu cuenta personal.")
 
+def tab_admin():
+    """Tab de utilidades admin: generador de credencial bcrypt para añadir users.
+    Solo visible si el user logueado es admin (`_is_admin()`)."""
+    st.markdown("### 🔧 Utilidades de administración")
+    st.caption(
+        "Solo accesible para administradores. Permite generar un hash bcrypt "
+        "para añadir un nuevo user del equipo a Streamlit Secrets."
+    )
+
+    st.markdown("#### Generar credencial para nuevo user")
+    with st.form("admin_new_user", clear_on_submit=False):
+        new_email = st.text_input(
+            "Email del nuevo user",
+            placeholder="nuevo.usuario@musicadders.com",
+            help="Email con el que entrará a la app.",
+        )
+        new_password = st.text_input(
+            "Contraseña",
+            type="password",
+            help="Contraseña que tendrá ese user. Mínimo 12 caracteres recomendado.",
+        )
+        submitted = st.form_submit_button("🔐 Generar credencial", type="primary")
+
+    if not submitted:
+        return
+
+    email_clean = (new_email or "").strip().lower()
+    # Validación estricta del email para evitar TOML injection en la línea generada.
+    if not re.fullmatch(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", email_clean):
+        st.error("Email inválido. Usa el formato estándar `usuario@dominio.com`.")
+        return
+    if not new_password or len(new_password) < 8:
+        st.error("Contraseña demasiado corta. Mínimo 8 caracteres.")
+        return
+
+    # Generar hash con bcrypt (cost 12, igual que el login).
+    hashed = bcrypt.hashpw(new_password.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode()
+
+    # Defensa adicional: rechazar hash con caracteres incompatibles con TOML basic string.
+    if '"' in hashed or "\\" in hashed:
+        st.error("Hash bcrypt inesperado. Reintenta.")
+        return
+
+    st.success("✅ Credencial generada. Cópiala a Streamlit Secrets.")
+    st.markdown("**Pega esta línea dentro del bloque `[users]` de Secrets:**")
+    toml_line = f'"{email_clean}" = "{hashed}"'
+    st.code(toml_line, language="toml")
+
+    st.markdown("**Próximos pasos:**")
+    st.markdown(
+        f"""
+1. Entra a https://share.streamlit.io → tu app → Settings → Secrets.
+2. En el bloque `[users]`, añade la línea de arriba.
+3. La app reinicia automáticamente en ~60s.
+4. Pásale a **{email_clean}** su email + la contraseña que has puesto, por canal privado.
+5. Ese user ya puede hacer login y crear playlists con la cuenta central.
+
+Nota: este hash NO se guarda en ningún log ni en session_state — solo se muestra en pantalla.
+"""
+    )
+
+
 def main_view():
     user = st.session_state.user_email
 
@@ -1562,17 +1624,25 @@ def main_view():
                 del st.session_state[k]
             st.rerun()
 
-    tab1, tab2, tab3 = st.tabs([
+    tab_titles = [
         "🔍 Buscar 1 ISRC",
         f"📊 Procesar Excel (max {MAX_BATCH_ISRCS})",
         "🎵 Crear playlist Spotify",
-    ])
-    with tab1:
+    ]
+    is_admin_user = _is_admin(st.session_state.get("user_email", ""))
+    if is_admin_user:
+        tab_titles.append("🔧 Admin")
+
+    tabs = st.tabs(tab_titles)
+    with tabs[0]:
         tab_individual()
-    with tab2:
+    with tabs[1]:
         tab_batch()
-    with tab3:
+    with tabs[2]:
         tab_playlist()
+    if is_admin_user:
+        with tabs[3]:
+            tab_admin()
 
 
 # ════════════════════════════════════════════════════════════════════════════
