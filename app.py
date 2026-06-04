@@ -26,6 +26,7 @@ import io
 import json
 import logging
 import os
+import random
 import re
 import secrets as _secrets_mod
 import threading
@@ -582,12 +583,16 @@ def spotify_find_uri_by_isrc(isrc: str) -> str | None:
 
 
 def spotify_resolve_isrcs(isrcs: list[str], progress_cb=None,
-                           max_workers: int = 16) -> dict:
+                           max_workers: int = 6) -> dict:
     """Resuelve ISRCs → URIs Spotify en paralelo, preservando orden.
 
-    Usa Client Credentials (token de app) + Session HTTP compartida con
-    connection pooling, para reducir overhead de TLS handshake.
-    Maneja 429 con Retry-After (cap 10s) y reintenta hasta 4 veces por ISRC.
+    Política conservadora anti-penalty-box:
+    - 6 workers paralelos máximo (≈30 req/s pico, ≈360/min teórico).
+    - Throttle proactivo per-worker (200ms ± jitter 50ms) para mantener
+      el ritmo sostenido bajo el umbral observado de Spotify Dev Mode.
+    - Retry-After respetado hasta 60s (Spotify a veces pide esperas largas
+      y capear bajo ese valor activa penalty box).
+    - Cooldown global compartido en 429 + reintentos limitados.
     """
     tok = spotify_client_credentials_token()
     if not tok:
@@ -610,12 +615,19 @@ def spotify_resolve_isrcs(isrcs: list[str], progress_cb=None,
     def _resolve_one(isrc: str) -> tuple[str, str, str | None]:
         """(isrc, kind, value). kind ∈ {'uri','notfound','error'}."""
         attempts = 0
+        # Throttle proactivo inicial con jitter para evitar burst sincronizado
+        # entre workers cuando arrancan a la vez. Sin esto, los N workers
+        # disparan a la vez al inicio y Spotify ve un pico de N req simultáneas.
+        time.sleep(random.uniform(0.0, 0.2))
         while attempts < 4:
             attempts += 1
+            # Throttle proactivo per-request: ritmo sostenido seguro
+            # 6 workers × 1 req cada 200ms ≈ 30 req/s pico ≈ 360/min teórico
+            time.sleep(0.2 + random.uniform(-0.05, 0.05))
             # Respeta cooldown global si está activo
             wait_global = cooldown_until["t"] - time.time()
             if wait_global > 0:
-                time.sleep(min(wait_global, 10))
+                time.sleep(min(wait_global, 60))
             with lock:
                 cur_tok = tok_ref["v"]
             try:
@@ -646,12 +658,18 @@ def spotify_resolve_isrcs(isrcs: list[str], progress_cb=None,
             if r.status_code == 429:
                 ra = r.headers.get("Retry-After")
                 try:
-                    wait = min(int(ra), 10) if ra else 2
+                    # Cap a 60s: si Spotify pide más, ya estamos cerca de penalty
+                    # box y conviene esperar lo que diga (mejor que reintentar pronto
+                    # y empeorar). Cap superior evita esperas absurdas si la API
+                    # devuelve un número raro.
+                    wait = min(int(ra), 60) if ra else 5
                 except ValueError:
-                    wait = 2
+                    wait = 5
                 # Cooldown global: el resto de hilos lo respeta y no martillean Spotify
                 cooldown_until["t"] = max(cooldown_until["t"], time.time() + wait)
-                time.sleep(wait + 0.05 * attempts)
+                # Backoff exponencial añadido en reintentos sucesivos para no
+                # martillear si el cooldown global no alcanza
+                time.sleep(wait + (2 ** attempts) * 0.1)
                 continue
 
             if 500 <= r.status_code < 600 and attempts <= 2:
