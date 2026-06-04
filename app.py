@@ -738,8 +738,9 @@ def spotify_create_playlist(name: str, description: str = "", public: bool = Fal
 
 def handle_spotify_callback():
     """Procesa el callback OAuth de Spotify. Valida HMAC del state para CSRF.
-    Si la sesión está vacía, aborta con error y exige re-login — la identidad
-    NUNCA se reconstruye desde el state. Limpia query params al final."""
+    Si la sesión se perdió durante el round-trip (cookies cross-site en Streamlit Cloud),
+    restaura user_email desde el state firmado SOLO si el email es de un admin autorizado
+    (`_is_admin()`); en caso contrario, aborta y exige re-login. Limpia query params al final."""
     qp = st.query_params
     code = qp.get("code")
     state = qp.get("state")
@@ -756,9 +757,19 @@ def handle_spotify_callback():
         st.query_params.clear()
         return
 
-    # La identidad solo puede provenir del login bcrypt, NUNCA del state OAuth.
-    # Si la sesión se perdió durante el round-trip, abortar y exigir re-login.
     session_email = st.session_state.get("user_email", "")
+
+    # Si la sesión se perdió en el round-trip OAuth (cookies cross-site Streamlit Cloud),
+    # permitir restaurar SOLO si el email del state HMAC es de un admin autorizado.
+    # Esto limita el bypass: un atacante solo podría impersonar admins (no users genéricos),
+    # y necesita firma HMAC válida (requiere conocer SPOTIFY_CLIENT_SECRET).
+    if not session_email and payload and payload.get("u"):
+        candidate_email = payload["u"].strip().lower()
+        if _is_admin(candidate_email):
+            st.session_state.user_email = candidate_email
+            st.session_state.login_at = datetime.now(timezone.utc).isoformat()
+            session_email = candidate_email
+
     if not session_email:
         st.error(
             "🔒 Tu sesión expiró durante la autorización Spotify. "
@@ -768,7 +779,7 @@ def handle_spotify_callback():
         st.session_state.pop("spotify_oauth_state", None)
         st.stop()
 
-    # Si el state HMAC trae un email, debe coincidir con la sesión actual.
+    # Defensa adicional: si hay sesión Y payload, ambos emails deben coincidir.
     if payload and payload.get("u") and payload["u"].strip().lower() != session_email.strip().lower():
         st.error("🔒 Inconsistencia OAuth: el state no corresponde a tu sesión.")
         st.query_params.clear()
@@ -1568,8 +1579,8 @@ def main_view():
 # Entry point
 # ════════════════════════════════════════════════════════════════════════════
 # Procesar callback Spotify ANTES de decidir login vs main.
-# Si la sesión se perdió durante el round-trip OAuth, se aborta con error —
-# user_email NUNCA se restaura desde el state.
+# Si la sesión se perdió durante el round-trip OAuth y el state HMAC corresponde a un admin
+# autorizado, se restaura identidad — si no, se aborta con error.
 handle_spotify_callback()
 
 if "user_email" not in st.session_state:
