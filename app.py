@@ -688,6 +688,12 @@ def spotify_resolve_isrcs(isrcs: list[str], progress_cb=None,
     total = len(isrcs)
     last_update = 0.0
 
+    # Aviso inicial antes de bloquear en el pool: si todos los workers caen
+    # en throttle/cooldown desde el primer instante (ej. penalty box activo),
+    # al menos el usuario ve el batch arrancado en vez de un spinner mudo.
+    if progress_cb:
+        progress_cb(0, total, f"esperando respuestas… (0/{total})")
+
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {ex.submit(_resolve_one, i): i for i in isrcs}
         for fut in as_completed(futures):
