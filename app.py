@@ -1596,38 +1596,53 @@ def tab_fuga():
         st.write("")
         run = st.button("🔍 Buscar", type="primary", width="stretch")
 
-    if not run:
+    # Ejecutar búsqueda solo cuando se pulsa el botón. El resultado se persiste
+    # en session_state para que los reruns provocados por los filtros NO disparen
+    # nuevas llamadas a FUGA ni hagan que la tabla desaparezca.
+    if run:
+        if date_from > date_to:
+            st.error("La fecha 'Desde' es posterior a 'Hasta'.")
+            return
+
+        prog = st.progress(0.0, text="Conectando con FUGA…")
+
+        def _cb(page, in_range, msg):
+            approx = min(0.95, (page + 1) / 80.0)
+            prog.progress(approx, text=msg)
+
+        with st.spinner("Buscando en FUGA…"):
+            rows, err = fuga_client.find_isrcs_in_date_range(date_from, date_to, progress_cb=_cb)
+        prog.empty()
+
+        st.session_state["fuga_last_result"] = {
+            "rows": rows,
+            "err": err,
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+        }
+
+    # Recuperar el último resultado (puede venir de este rerun o de uno previo).
+    last = st.session_state.get("fuga_last_result")
+    if not last:
+        return  # aún no se ha pulsado Buscar nunca
+
+    if last.get("err"):
+        st.error(last["err"])
         return
 
-    if date_from > date_to:
-        st.error("La fecha 'Desde' es posterior a 'Hasta'.")
-        return
-
-    prog = st.progress(0.0, text="Conectando con FUGA…")
-
-    def _cb(page, in_range, msg):
-        # Estimación visual: usa el número de productos en rango como proxy.
-        # La barra no llega a 100% hasta el extract final.
-        approx = min(0.95, (page + 1) / 80.0)
-        prog.progress(approx, text=msg)
-
-    with st.spinner("Buscando en FUGA…"):
-        rows, err = fuga_client.find_isrcs_in_date_range(date_from, date_to, progress_cb=_cb)
-    prog.empty()
-
-    if err:
-        st.error(err)
-        return
+    rows = last.get("rows") or []
+    last_from = last.get("date_from") or ""
+    last_to = last.get("date_to") or ""
 
     if not rows:
-        st.warning(f"No se encontraron tracks lanzados entre {date_from} y {date_to}.")
+        st.warning(f"No se encontraron tracks lanzados entre {last_from} y {last_to}.")
         return
 
     df = pd.DataFrame(rows)
     n_releases = df["product_name"].nunique() if "product_name" in df.columns else 0
     st.success(
         f"Encontrados **{len(rows):,} ISRCs únicos** en **{n_releases:,} releases** "
-        f"lanzados entre {date_from} y {date_to}."
+        f"lanzados entre {last_from} y {last_to}."
     )
 
     # Filtros de búsqueda libre encima de la tabla
@@ -1684,7 +1699,7 @@ def tab_fuga():
         st.download_button(
             "📊 Excel completo (todos los datos)",
             data=buf_full.getvalue(),
-            file_name=f"fuga_catalogo_{date_from}_a_{date_to}.xlsx",
+            file_name=f"fuga_catalogo_{last_from}_a_{last_to}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
@@ -1696,7 +1711,7 @@ def tab_fuga():
         st.download_button(
             "🎯 Excel solo ISRC (para subir)",
             data=buf_only.getvalue(),
-            file_name=f"fuga_isrcs_{date_from}_a_{date_to}.xlsx",
+            file_name=f"fuga_isrcs_{last_from}_a_{last_to}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
@@ -1705,7 +1720,7 @@ def tab_fuga():
         st.download_button(
             "📄 CSV completo",
             data=csv,
-            file_name=f"fuga_catalogo_{date_from}_a_{date_to}.csv",
+            file_name=f"fuga_catalogo_{last_from}_a_{last_to}.csv",
             mime="text/csv",
             use_container_width=True,
         )
