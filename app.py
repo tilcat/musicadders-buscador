@@ -1630,33 +1630,80 @@ def tab_fuga():
         f"lanzados entre {date_from} y {date_to}."
     )
 
+    # Filtros de búsqueda libre encima de la tabla
+    st.markdown("#### 🔎 Filtrar resultados")
+    f_col1, f_col2, f_col3 = st.columns(3)
+    with f_col1:
+        q_artist = st.text_input("Artista contiene", value="", key="fuga_q_artist",
+                                  placeholder="ej. Pure Negga")
+    with f_col2:
+        q_label = st.text_input("Sello contiene", value="", key="fuga_q_label",
+                                 placeholder="ej. Rapport")
+    with f_col3:
+        q_release = st.text_input("Release contiene", value="", key="fuga_q_release",
+                                   placeholder="ej. Bora Bora")
+
+    df_view = df.copy()
+    if q_artist.strip():
+        df_view = df_view[df_view["artist_name"].fillna("").str.contains(
+            q_artist.strip(), case=False, regex=False)]
+    if q_label.strip():
+        df_view = df_view[df_view["label"].fillna("").str.contains(
+            q_label.strip(), case=False, regex=False)]
+    if q_release.strip():
+        df_view = df_view[df_view["product_name"].fillna("").str.contains(
+            q_release.strip(), case=False, regex=False)]
+
+    st.caption(f"Mostrando {len(df_view):,} de {len(df):,} ISRCs.")
+
     st.dataframe(
-        df.rename(columns={
+        df_view.rename(columns={
             "isrc": "ISRC", "product_name": "Release", "artist_name": "Artista",
             "label": "Sello", "release_date": "Fecha lanzamiento",
         }),
         use_container_width=True, hide_index=True, height=400,
     )
 
-    # Descargas: Excel + CSV
-    col_x1, col_x2 = st.columns(2)
+    # Descargas: Excel completo + Excel solo ISRC + CSV
+    st.markdown("#### 📥 Descargar")
+    st.caption("Las descargas respetan los filtros aplicados arriba.")
+    col_x1, col_x2, col_x3 = st.columns(3)
+    import io as _io
+
+    # Renombrar columnas para todas las descargas
+    df_export = df_view.rename(columns={
+        "isrc": "ISRC", "product_name": "Release", "artist_name": "Artista",
+        "label": "Sello", "release_date": "Fecha lanzamiento",
+    })
+
     with col_x1:
-        # Excel con solo la columna ISRC, listo para subir a Procesar Excel / Crear playlist.
-        import io as _io
-        buf = _io.BytesIO()
-        df[["isrc"]].rename(columns={"isrc": "ISRC"}).to_excel(buf, index=False, engine="openpyxl")
-        buf.seek(0)
+        # Excel con TODAS las columnas (metadata completa)
+        buf_full = _io.BytesIO()
+        df_export.to_excel(buf_full, index=False, engine="openpyxl")
+        buf_full.seek(0)
         st.download_button(
-            "📥 Descargar Excel (solo ISRC, listo para subir)",
-            data=buf.getvalue(),
+            "📊 Excel completo (todos los datos)",
+            data=buf_full.getvalue(),
             file_name=f"fuga_catalogo_{date_from}_a_{date_to}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
     with col_x2:
-        csv = df.to_csv(index=False).encode("utf-8")
+        # Excel con solo ISRC, listo para subir a "Procesar Excel" o "Crear playlist"
+        buf_only = _io.BytesIO()
+        df_export[["ISRC"]].to_excel(buf_only, index=False, engine="openpyxl")
+        buf_only.seek(0)
         st.download_button(
-            "📥 Descargar CSV (con metadata completa)",
+            "🎯 Excel solo ISRC (para subir)",
+            data=buf_only.getvalue(),
+            file_name=f"fuga_isrcs_{date_from}_a_{date_to}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    with col_x3:
+        csv = df_export.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "📄 CSV completo",
             data=csv,
             file_name=f"fuga_catalogo_{date_from}_a_{date_to}.csv",
             mime="text/csv",
@@ -1664,8 +1711,8 @@ def tab_fuga():
         )
 
     st.info(
-        "💡 Para usar estos ISRCs: descarga el Excel y súbelo en la tab **📊 Procesar Excel** o "
-        "en **🎵 Crear playlist Spotify** > Subir Excel."
+        "💡 Para usar estos ISRCs en otras pestañas: descarga el **Excel solo ISRC** "
+        "y súbelo en **📊 Procesar Excel** o **🎵 Crear playlist Spotify** > Subir Excel."
     )
 
 
