@@ -41,6 +41,8 @@ import pandas as pd
 import requests
 import streamlit as st
 
+import fuga_client
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # CONSTANTES
@@ -1564,6 +1566,109 @@ def _tab_playlist_central():
         st.link_button("Abrir en Spotify", pl_url, type="primary")
     st.caption(f"La playlist está en la cuenta Spotify central del equipo (**{display_name}**), no en tu cuenta personal.")
 
+def tab_fuga():
+    """Tab Catálogo FUGA: busca ISRCs por rango de fechas de lanzamiento
+    paginando FUGA en orden descendente. Sin cache: cada búsqueda consulta en vivo."""
+    st.markdown("### 📁 Catálogo FUGA — buscar por fecha de lanzamiento")
+    st.caption(
+        "Busca productos por `consumer_release_date`. La consulta es en vivo: "
+        "para rangos cortos (días/semanas) tarda segundos; para rangos largos "
+        "(meses/año) hasta 1-2 min."
+    )
+
+    creds_ok = bool(st.secrets.get("FUGA_USER", "")) and bool(st.secrets.get("FUGA_PASS", ""))
+    if not creds_ok:
+        st.error(
+            "⚠️ Falta configurar `FUGA_USER` y `FUGA_PASS` en Streamlit Secrets. "
+            "Pide ayuda al admin."
+        )
+        return
+
+    st.markdown("#### Rango de fechas de lanzamiento")
+    today = datetime.now().date()
+    col_d1, col_d2, col_act = st.columns([2, 2, 1])
+    with col_d1:
+        default_from = today.replace(month=max(1, today.month - 1))
+        date_from = st.date_input("Desde", value=default_from, key="fuga_date_from")
+    with col_d2:
+        date_to = st.date_input("Hasta", value=today, key="fuga_date_to")
+    with col_act:
+        st.write("")
+        run = st.button("🔍 Buscar", type="primary", width="stretch")
+
+    if not run:
+        return
+
+    if date_from > date_to:
+        st.error("La fecha 'Desde' es posterior a 'Hasta'.")
+        return
+
+    prog = st.progress(0.0, text="Conectando con FUGA…")
+
+    def _cb(page, in_range, msg):
+        # Estimación visual: usa el número de productos en rango como proxy.
+        # La barra no llega a 100% hasta el extract final.
+        approx = min(0.95, (page + 1) / 80.0)
+        prog.progress(approx, text=msg)
+
+    with st.spinner("Buscando en FUGA…"):
+        rows, err = fuga_client.find_isrcs_in_date_range(date_from, date_to, progress_cb=_cb)
+    prog.empty()
+
+    if err:
+        st.error(err)
+        return
+
+    if not rows:
+        st.warning(f"No se encontraron tracks lanzados entre {date_from} y {date_to}.")
+        return
+
+    df = pd.DataFrame(rows)
+    n_releases = df["product_name"].nunique() if "product_name" in df.columns else 0
+    st.success(
+        f"Encontrados **{len(rows):,} ISRCs únicos** en **{n_releases:,} releases** "
+        f"lanzados entre {date_from} y {date_to}."
+    )
+
+    st.dataframe(
+        df.rename(columns={
+            "isrc": "ISRC", "product_name": "Release", "artist_name": "Artista",
+            "label": "Sello", "release_date": "Fecha lanzamiento",
+        }),
+        use_container_width=True, hide_index=True, height=400,
+    )
+
+    # Descargas: Excel + CSV
+    col_x1, col_x2 = st.columns(2)
+    with col_x1:
+        # Excel con solo la columna ISRC, listo para subir a Procesar Excel / Crear playlist.
+        import io as _io
+        buf = _io.BytesIO()
+        df[["isrc"]].rename(columns={"isrc": "ISRC"}).to_excel(buf, index=False, engine="openpyxl")
+        buf.seek(0)
+        st.download_button(
+            "📥 Descargar Excel (solo ISRC, listo para subir)",
+            data=buf.getvalue(),
+            file_name=f"fuga_catalogo_{date_from}_a_{date_to}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    with col_x2:
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "📥 Descargar CSV (con metadata completa)",
+            data=csv,
+            file_name=f"fuga_catalogo_{date_from}_a_{date_to}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    st.info(
+        "💡 Para usar estos ISRCs: descarga el Excel y súbelo en la tab **📊 Procesar Excel** o "
+        "en **🎵 Crear playlist Spotify** > Subir Excel."
+    )
+
+
 def tab_admin():
     """Tab de utilidades admin: generador de credencial bcrypt para añadir users.
     Solo visible si el user logueado es admin (`_is_admin()`)."""
@@ -1648,11 +1753,7 @@ def main_view():
                 del st.session_state[k]
             st.rerun()
 
-    tab_titles = [
-        "🔍 Buscar 1 ISRC",
-        f"📊 Procesar Excel (max {MAX_BATCH_ISRCS})",
-        "🎵 Crear playlist Spotify",
-    ]
+    tab_titles = ["🔍 Buscar 1 ISRC", "📊 Procesar Excel (max 500)", "🎵 Crear playlist Spotify", "📁 Catálogo FUGA"]
     is_admin_user = _is_admin(st.session_state.get("user_email", ""))
     if is_admin_user:
         tab_titles.append("🔧 Admin")
@@ -1664,8 +1765,10 @@ def main_view():
         tab_batch()
     with tabs[2]:
         tab_playlist()
+    with tabs[3]:
+        tab_fuga()
     if is_admin_user:
-        with tabs[3]:
+        with tabs[4]:
             tab_admin()
 
 
