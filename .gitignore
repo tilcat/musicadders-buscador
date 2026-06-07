@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .DS_Store
 .venv/
+
+# MCP local (no subir credenciales SharePoint a repo público)
+mcp/sharepoint/.env
+mcp/sharepoint/node_modules/

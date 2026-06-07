@@ -42,6 +42,7 @@ import requests
 import streamlit as st
 
 import fuga_client
+from cards import _build_card_html
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -901,30 +902,7 @@ def render_playlist_cards(pls_view: list[dict]):
         icon = PLAT_ICONS.get(plat, "🎶")
         st.markdown(f"#### {icon} {plat.title()} · {len(items)} playlists")
         for p in items:
-            t = p.get("playlist_type") or ""
-            css_class = (
-                "algorithmic" if "algorithmic" in t.lower() or "algotorial" in t.lower() else
-                "charts" if "chart" in t.lower() else
-                "user" if t == "Curators & Listeners" else ""
-            )
-            subs = p.get("subscriber_count")
-            subs_fmt = f"{subs:,}" if subs and subs >= 1000 else (str(subs) if subs else "—")
-            pos = p.get("position") or "—"
-            countries = p.get("country_code") or ""
-            variantes = f" · {p['n_variantes']} variantes" if p.get("n_variantes", 1) > 1 else ""
-            entry = (p.get("entry_date") or "")[:10]
-            meta_line = (
-                f"{t} · pos #{pos} · {subs_fmt} subs · {countries or 'global'}"
-                f"{variantes}"
-                f"{' · entró ' + entry if entry else ''}"
-            )
-            st.markdown(
-                f"<div class='ma-pl-card {css_class}'>"
-                f"<div class='pl-name'>{p.get('playlist_name','?')}</div>"
-                f"<div class='pl-meta'>{meta_line}</div>"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
+            st.markdown(_build_card_html(p), unsafe_allow_html=True)
 
 
 PLATFORM_SCOPE_OPTIONS = [
