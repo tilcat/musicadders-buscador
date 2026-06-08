@@ -341,7 +341,11 @@ def _app_base_url() -> str:
 def _state_secret_key() -> bytes:
     """Clave HMAC para firmar el `state` OAuth. Deriva de CLIENT_SECRET de Spotify
     (ya gestionado en Streamlit Secrets), así no requiere config adicional."""
-    cs = st.secrets.get("SPOTIFY_CLIENT_SECRET", "") or "ma-default-key"
+    cs = st.secrets.get("SPOTIFY_CLIENT_SECRET", "").strip()
+    if not cs:
+        raise RuntimeError(
+            "SPOTIFY_CLIENT_SECRET no configurado: el state OAuth no puede firmarse de forma segura"
+        )
     return hashlib.sha256(cs.encode("utf-8")).digest()
 
 
@@ -360,7 +364,10 @@ def _decode_oauth_state(state: str) -> dict | None:
     if not state or "." not in state:
         return None
     raw, sig = state.rsplit(".", 1)
-    expected = hmac.new(_state_secret_key(), raw.encode(), hashlib.sha256).hexdigest()[:16]
+    try:
+        expected = hmac.new(_state_secret_key(), raw.encode(), hashlib.sha256).hexdigest()[:16]
+    except RuntimeError:
+        return None  # secret no configurado: fallo controlado (state inválido)
     if not hmac.compare_digest(sig, expected):
         return None
     try:
@@ -378,7 +385,10 @@ def spotify_login_url() -> str | None:
     cid = st.secrets.get("SPOTIFY_CLIENT_ID", "").strip()
     if not cid:
         return None
-    state = _encode_oauth_state(st.session_state.get("user_email", ""))
+    try:
+        state = _encode_oauth_state(st.session_state.get("user_email", ""))
+    except RuntimeError:
+        return None  # secret no configurado: fallo controlado (igual que sin CLIENT_ID)
     st.session_state.spotify_oauth_state = state
     params = {
         "client_id": cid,
@@ -461,13 +471,10 @@ def spotify_user_id() -> str | None:
     return st.session_state.spotify_user_id
 
 
-def spotify_client_credentials_token() -> str | None:
-    """Token a nivel de app (Client Credentials). Independiente del user OAuth.
-    Útil para Search masivo: tiene su propio bucket de rate limit."""
-    tok = st.session_state.get("sp_cc_token")
-    exp = st.session_state.get("sp_cc_token_exp", 0)
-    if tok and time.time() < exp - 60:
-        return tok
+def _fetch_cc_token_raw() -> tuple[str, int] | None:
+    """Obtiene un Client Credentials token de Spotify sin tocar st.session_state.
+    Seguro para llamar desde worker threads.
+    Devuelve (access_token, expires_in) o None si falla."""
     cid = st.secrets.get("SPOTIFY_CLIENT_ID", "").strip()
     cs = st.secrets.get("SPOTIFY_CLIENT_SECRET", "").strip()
     if not (cid and cs):
@@ -483,9 +490,27 @@ def spotify_client_credentials_token() -> str | None:
     if r.status_code != 200:
         return None
     d = r.json()
-    st.session_state.sp_cc_token = d["access_token"]
-    st.session_state.sp_cc_token_exp = time.time() + int(d.get("expires_in", 3600))
-    return d["access_token"]
+    tok = d.get("access_token")
+    if not tok:
+        return None
+    return (tok, int(d.get("expires_in", 3600)))
+
+
+def spotify_client_credentials_token() -> str | None:
+    """Token a nivel de app (Client Credentials). Independiente del user OAuth.
+    Útil para Search masivo: tiene su propio bucket de rate limit.
+    Solo llamar desde el hilo principal (usa st.session_state como caché)."""
+    tok = st.session_state.get("sp_cc_token")
+    exp = st.session_state.get("sp_cc_token_exp", 0)
+    if tok and time.time() < exp - 60:
+        return tok
+    result = _fetch_cc_token_raw()
+    if not result:
+        return None
+    new_tok, expires_in = result
+    st.session_state.sp_cc_token = new_tok
+    st.session_state.sp_cc_token_exp = time.time() + expires_in
+    return new_tok
 
 
 def central_refresh_access_token() -> str | None:
@@ -648,12 +673,14 @@ def spotify_resolve_isrcs(isrcs: list[str], progress_cb=None,
                 return (isrc, "uri", items[0]["uri"]) if items else (isrc, "notfound", None)
 
             if r.status_code == 401:
-                # CC token caducó: renovar (un solo hilo a la vez)
+                # CC token caducó: renovar (un solo hilo a la vez).
+                # Usamos _fetch_cc_token_raw() (sin st.session_state) porque
+                # estamos en un worker thread donde session_state no es seguro.
                 with lock:
                     if tok_ref["v"] == cur_tok:
-                        new_tok = spotify_client_credentials_token()
-                        if new_tok:
-                            tok_ref["v"] = new_tok
+                        raw = _fetch_cc_token_raw()
+                        if raw:
+                            tok_ref["v"] = raw[0]
                 if attempts <= 2:
                     continue
                 return (isrc, "error", "auth 401")
