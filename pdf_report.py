@@ -9,6 +9,7 @@ Diferencias clave:
 """
 from __future__ import annotations
 
+import html
 import io
 from datetime import datetime
 from pathlib import Path
@@ -112,33 +113,36 @@ def _playlist_card(pl: dict, styles: dict):
     else:
         img = Paragraph("(sin portada)", styles["meta"])
 
-    name = pl.get("playlist_name") or "—"
-    plat = (pl.get("platform") or "").title()
-    ptype = pl.get("playlist_type") or "—"
-    country = pl.get("country_code") or ""
+    name = html.escape(pl.get("playlist_name") or "—")
+    plat = html.escape((pl.get("platform") or "").title())
+    ptype_raw = pl.get("playlist_type") or "—"
+    ptype = html.escape(ptype_raw)
+    country = html.escape(pl.get("country_code") or "")
     subs = pl.get("subscriber_count") or 0
     pos = pl.get("position")
     peak = pl.get("peak_position")
-    entry = (pl.get("entry_date") or "")[:10]
-    peak_d = (pl.get("peak_position_date") or "")[:10]
+    entry = html.escape((pl.get("entry_date") or "")[:10])
+    peak_d = html.escape((pl.get("peak_position_date") or "")[:10])
 
     type_color = {
         "Editorial": "#1ED760",
         "Algorithmic": "#A855F7",
         "Charts": "#F59E0B",
-    }.get(ptype, "#06B6D4" if "algotorial" in ptype.lower() else "#6B7280")
+    }.get(ptype_raw, "#06B6D4" if "algotorial" in ptype_raw.lower() else "#6B7280")
 
     country_html = f' · <font size="11">{country}</font>' if country else ""
     peak_html = f" <font size='10' color='#9ca3af'>({peak_d})</font>" if peak_d else ""
     subs_str = f"{int(subs):,}" if subs else "—"
+    pos_str = html.escape(str(pos)) if pos is not None else "—"
+    peak_str = html.escape(str(peak)) if peak is not None else "—"
     info_html = (
         f'<font name="Helvetica-Bold" size="13" color="#0f172a">{name}</font><br/>'
         f'<font size="11" color="#6b7280">{plat}</font> · '
         f'<font size="11" color="{type_color}"><b>{ptype}</b></font>{country_html}'
         f'<br/><br/>'
         f'<font size="12" color="#374151"><b>{subs_str}</b> subscribers</font><br/>'
-        f'<font size="12" color="#374151">Posición: <b>{pos or "—"}</b>'
-        f' · Mejor: <b>{peak or "—"}</b>{peak_html}</font><br/>'
+        f'<font size="12" color="#374151">Posición: <b>{pos_str}</b>'
+        f' · Mejor: <b>{peak_str}</b>{peak_html}</font><br/>'
         f'<font size="11" color="#6b7280">Entró: {entry or "—"}</font>'
     )
     info = Paragraph(info_html, styles["meta"])
@@ -158,15 +162,15 @@ def _playlist_card(pl: dict, styles: dict):
 
 
 def _song_header(isrc: str, song_name: str, artist_name: str, styles: dict):
-    html = (
-        f'<font name="Helvetica-Bold" size="15" color="#0f172a">{song_name or "—"}</font>'
+    markup = (
+        f'<font name="Helvetica-Bold" size="15" color="#0f172a">{html.escape(song_name or "—")}</font>'
         f' &nbsp;<font size="12" color="#374151">·</font> '
-        f'<font size="13" color="#374151">{artist_name or "—"}</font><br/>'
-        f'<font size="10" color="#9ca3af">ISRC: {isrc}</font>'
+        f'<font size="13" color="#374151">{html.escape(artist_name or "—")}</font><br/>'
+        f'<font size="10" color="#9ca3af">ISRC: {html.escape(isrc)}</font>'
     )
     return KeepTogether([
         Spacer(1, 8),
-        Paragraph(html, styles["meta"]),
+        Paragraph(markup, styles["meta"]),
         HRFlowable(width="100%", thickness=1, color=colors.HexColor("#1ED760"),
                    spaceBefore=2, spaceAfter=6),
     ])
