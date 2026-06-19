@@ -684,12 +684,26 @@ def spotify_resolve_isrcs(isrcs: list[str], progress_cb=None,
         return {"uris": [], "not_found": [], "errors": [(i, "no CC token") for i in isrcs],
                 "stopped": True, "reason": "No se pudo obtener Client Credentials token."}
 
-    # Session compartida con pool grande: reusa conexiones TLS entre hilos
-    sess = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(
-        pool_connections=max_workers, pool_maxsize=max_workers * 2,
+    # Sesión POR HILO (no compartida). requests.Session no es thread-safe; al
+    # compartir una sola entre 6 workers, reutilizar del pool una conexión que
+    # Spotify ya cerró (keep-alive ocioso) provoca RemoteDisconnected
+    # ("Remote end closed connection without response"). Cada hilo con su propia
+    # sesión + Retry a nivel de conexión (reintenta en conexión nueva).
+    _retry = requests.adapters.Retry(
+        total=3, connect=3, read=2, backoff_factor=0.4,
+        status_forcelist=(502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
     )
-    sess.mount("https://", adapter)
+    _tls = threading.local()
+
+    def _session() -> requests.Session:
+        s = getattr(_tls, "sess", None)
+        if s is None:
+            s = requests.Session()
+            s.mount("https://", requests.adapters.HTTPAdapter(
+                pool_connections=2, pool_maxsize=4, max_retries=_retry))
+            _tls.sess = s
+        return s
 
     lock = threading.Lock()
     tok_ref = {"v": tok}
@@ -725,14 +739,23 @@ def spotify_resolve_isrcs(isrcs: list[str], progress_cb=None,
             with lock:
                 cur_tok = tok_ref["v"]
             try:
-                r = sess.get(
+                r = _session().get(
                     f"{SP_API}/search",
                     headers={"Authorization": f"Bearer {cur_tok}"},
                     params={"q": f"isrc:{isrc}", "type": "track", "limit": 1},
                     timeout=15,
                 )
             except requests.RequestException as e:
+                # Caída de conexión (RemoteDisconnected, etc.): transitoria →
+                # reintenta en conexión nueva en vez de rendirse al primer fallo.
                 _log_err(isrc, f"net: {str(e)[:80]}")
+                if attempts <= 3:
+                    try:
+                        _tls.sess = None  # fuerza sesión/conexión nueva en el reintento
+                    except Exception:
+                        pass
+                    time.sleep(0.3 * attempts)
+                    continue
                 return (isrc, "error", f"net: {str(e)[:50]}")
 
             if r.status_code == 200:
