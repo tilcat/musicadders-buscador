@@ -668,16 +668,18 @@ def spotify_find_uri_by_isrc(isrc: str) -> str | None:
 
 
 def spotify_resolve_isrcs(isrcs: list[str], progress_cb=None,
-                           max_workers: int = 6) -> dict:
+                           max_workers: int = 2) -> dict:
     """Resuelve ISRCs → URIs Spotify en paralelo, preservando orden.
 
-    Política conservadora anti-penalty-box:
-    - 6 workers paralelos máximo (≈30 req/s pico, ≈360/min teórico).
-    - Throttle proactivo per-worker (200ms ± jitter 50ms) para mantener
-      el ritmo sostenido bajo el umbral observado de Spotify Dev Mode.
+    Política conservadora anti-penalty-box (Spotify Development Mode tiene
+    límites de rate MUY bajos; 6 hilos a ~30 req/s disparaban 429 en lote):
+    - 2 workers paralelos máximo (≈3-4 req/s pico).
+    - Throttle proactivo per-worker (~500ms ± jitter) para ritmo sostenido bajo.
     - Retry-After respetado hasta 60s (Spotify a veces pide esperas largas
       y capear bajo ese valor activa penalty box).
     - Cooldown global compartido en 429 + reintentos limitados.
+    Para lotes grandes de forma fiable hace falta Extended Quota Mode (quita el
+    límite de 25 users y sube el rate); se solicita en el dashboard de Spotify.
     """
     tok = spotify_client_credentials_token()
     if not tok:
@@ -730,8 +732,8 @@ def spotify_resolve_isrcs(isrcs: list[str], progress_cb=None,
         while attempts < 4:
             attempts += 1
             # Throttle proactivo per-request: ritmo sostenido seguro
-            # 6 workers × 1 req cada 200ms ≈ 30 req/s pico ≈ 360/min teórico
-            time.sleep(0.2 + random.uniform(-0.05, 0.05))
+            # 2 workers × 1 req cada ~500ms ≈ 3-4 req/s pico (Dev Mode)
+            time.sleep(0.5 + random.uniform(-0.1, 0.1))
             # Respeta cooldown global si está activo
             wait_global = cooldown_until["t"] - time.time()
             if wait_global > 0:
