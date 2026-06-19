@@ -696,6 +696,15 @@ def spotify_resolve_isrcs(isrcs: list[str], progress_cb=None,
     # Si Spotify nos manda un 429 con Retry-After largo, pausamos todos
     # los hilos en lugar de que cada uno espere de forma independiente.
     cooldown_until = {"t": 0.0}
+    # Diagnóstico: loguea el motivo REAL de los primeros errores de resolución
+    # (status de Spotify) para distinguir 429/penalty-box de 403/otros.
+    _err_diag = {"n": 0}
+
+    def _log_err(isrc: str, reason: str) -> None:
+        with lock:
+            if _err_diag["n"] < 8:
+                _err_diag["n"] += 1
+                logging.warning("Spotify resolve · %s → %s", isrc, reason)
 
     def _resolve_one(isrc: str) -> tuple[str, str, str | None]:
         """(isrc, kind, value). kind ∈ {'uri','notfound','error'}."""
@@ -723,6 +732,7 @@ def spotify_resolve_isrcs(isrcs: list[str], progress_cb=None,
                     timeout=15,
                 )
             except requests.RequestException as e:
+                _log_err(isrc, f"net: {str(e)[:80]}")
                 return (isrc, "error", f"net: {str(e)[:50]}")
 
             if r.status_code == 200:
@@ -740,6 +750,7 @@ def spotify_resolve_isrcs(isrcs: list[str], progress_cb=None,
                             tok_ref["v"] = raw[0]
                 if attempts <= 2:
                     continue
+                _log_err(isrc, "auth 401 (CC token no renovable; revisa CLIENT_ID/SECRET)")
                 return (isrc, "error", "auth 401")
 
             if r.status_code == 429:
@@ -763,8 +774,10 @@ def spotify_resolve_isrcs(isrcs: list[str], progress_cb=None,
                 time.sleep(2 * attempts)
                 continue
 
+            _log_err(isrc, f"http {r.status_code}: {(r.text or '')[:180]}")
             return (isrc, "error", f"http {r.status_code}")
 
+        _log_err(isrc, "rate-limited 429 (agotados 4 intentos con backoff)")
         return (isrc, "error", "rate-limited (4 intentos)")
 
     results: dict[str, tuple[str, str, str | None]] = {}
