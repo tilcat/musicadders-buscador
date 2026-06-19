@@ -33,7 +33,7 @@ import threading
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import bcrypt
@@ -333,6 +333,18 @@ SP_AUTH_URL = "https://accounts.spotify.com/authorize"
 SP_API = "https://api.spotify.com/v1"
 
 
+def _record_sp_error(context: str, r) -> None:
+    """Guarda el status + cuerpo reales de un fallo de Spotify para diagnóstico.
+    Se muestra al admin en la UI en lugar del genérico 'error desconocido'."""
+    try:
+        body = (r.text or "")[:400]
+    except Exception:
+        body = "?"
+    detalle = f"{context}: HTTP {getattr(r, 'status_code', '?')} — {body}"
+    st.session_state["sp_last_error"] = detalle
+    logging.error("Spotify error · %s", detalle[:350])
+
+
 def _app_base_url() -> str:
     """Base URL exacta de la app (para construir el redirect URI Spotify)."""
     return str(st.secrets.get("APP_BASE_URL", "https://musicadders-isrc.streamlit.app")).rstrip("/")
@@ -536,7 +548,26 @@ def central_refresh_access_token() -> str | None:
         )
     except requests.exceptions.RequestException:
         return None
+    if r.status_code in (400, 401):
+        try:
+            err_body = r.json()
+        except Exception:
+            err_body = {}
+        if err_body.get("error") == "invalid_grant":
+            st.session_state.spotify_central_token_dead = True
+            logging.error(
+                "SPOTIFY_CENTRAL_REFRESH_TOKEN inválido (invalid_grant): "
+                "el token ha caducado/revocado (política Spotify: 6 meses) "
+                "O SPOTIFY_CLIENT_ID/SPOTIFY_CLIENT_SECRET han cambiado. "
+                "El admin debe verificar AMBOS en Streamlit Secrets y reconectar "
+                "la cuenta central via la pestaña Setup."
+            )
+            return None
+        # 400/401 sin invalid_grant → transitorio (credenciales incorrectas u otro error)
+        _record_sp_error("refresh token central", r)
+        return None
     if r.status_code != 200:
+        _record_sp_error("refresh token central", r)
         return None
     d = r.json()
     st.session_state.spotify_central_access_token = d["access_token"]
@@ -551,6 +582,28 @@ def central_refresh_access_token() -> str | None:
                 "El token actual sigue activo pero puede caducar pronto."
             )
         logging.warning("Spotify rotated central refresh_token. Admin must update Streamlit Secrets.")
+    # Aviso proactivo de caducidad próxima (política 6 meses).
+    # Solo si SPOTIFY_CENTRAL_REFRESH_TOKEN_ISSUED existe, es parseable y queda 0 < días <= 14.
+    # Flag de sesión _token_expiry_warned evita emitir el warning más de una vez por sesión.
+    _issued_raw = str(st.secrets.get("SPOTIFY_CENTRAL_REFRESH_TOKEN_ISSUED", "")).strip()
+    if (
+        _issued_raw
+        and _is_admin(st.session_state.get("user_email", ""))
+        and not st.session_state.get("_token_expiry_warned")
+    ):
+        try:
+            _issued_date = date.fromisoformat(_issued_raw)
+            _days_left = 180 - (date.today() - _issued_date).days
+            if 0 < _days_left <= 14:
+                st.warning(
+                    f"El refresh token de Spotify caduca en {_days_left} dia(s) "
+                    "(política Spotify: 6 meses). Ve a la pestaña Setup, reconecta la cuenta "
+                    "central y actualiza SPOTIFY_CENTRAL_REFRESH_TOKEN en Streamlit Secrets."
+                )
+                st.session_state["_token_expiry_warned"] = True
+        except Exception:
+            pass  # secret mal formado → silencioso
+    st.session_state.pop("spotify_central_token_dead", None)
     return d["access_token"]
 
 
@@ -577,12 +630,16 @@ def central_user_info() -> dict | None:
         return None
     r = requests.get(f"{SP_API}/me", headers={"Authorization": f"Bearer {tok}"}, timeout=15)
     if r.status_code != 200:
+        _record_sp_error("verificar cuenta central (GET /me)", r)
         return None
     me = r.json()
     expected_id = str(st.secrets.get("SPOTIFY_CENTRAL_EXPECTED_USER_ID", "")).strip()
     if expected_id and me.get("id") != expected_id:
         # Cuenta central sustituida en Secrets sin permiso. Abortar.
         logging.error(f"CENTRAL ACCOUNT MISMATCH: expected={expected_id}, got={me.get('id')}")
+        st.session_state["sp_last_error"] = (
+            f"cuenta central distinta de la esperada: SPOTIFY_CENTRAL_EXPECTED_USER_ID="
+            f"{expected_id} pero el token es de {me.get('id')}")
         return None
     st.session_state.spotify_central_user_id = me.get("id")
     st.session_state.spotify_central_display_name = me.get("display_name") or me.get("id")
@@ -786,6 +843,7 @@ def spotify_create_playlist(name: str, description: str = "", public: bool = Fal
                 timeout=15,
             )
     if r.status_code not in (200, 201):
+        _record_sp_error("crear playlist (POST /me/playlists)", r)
         return None
     return r.json()
 
@@ -845,6 +903,7 @@ def handle_spotify_callback():
         st.session_state.spotify_refresh_token = data.get("refresh_token")
         st.session_state.spotify_access_token = data["access_token"]
         st.session_state.spotify_token_expires = time.time() + int(data.get("expires_in", 3600))
+        st.session_state.pop("spotify_central_token_dead", None)
         st.success("✅ Spotify conectado correctamente.")
     else:
         st.error("No se pudo intercambiar el code Spotify. Revisa CLIENT_ID/SECRET en Secrets.")
@@ -1337,8 +1396,10 @@ def _tab_playlist_central():
                 "1. Entra a https://share.streamlit.io\n"
                 "2. Tu app → Settings → Secrets\n"
                 "3. Añade: `SPOTIFY_CENTRAL_REFRESH_TOKEN = \"valor_pegado\"`\n"
-                "4. La app reinicia automáticamente en ~60s\n"
-                "5. Vuelve a este tab y verás el encabezado verde con el nombre de la cuenta Spotify central"
+                f"4. Añade también: `SPOTIFY_CENTRAL_REFRESH_TOKEN_ISSUED = \"{date.today().isoformat()}\"` "
+                "— esto activa los avisos de caducidad automáticos (política Spotify: 6 meses).\n"
+                "5. La app reinicia automáticamente en ~60s\n"
+                "6. Vuelve a este tab y verás el encabezado verde con el nombre de la cuenta Spotify central"
             )
             # Estado terminal: no continuar al flujo de creación
             return
@@ -1362,11 +1423,21 @@ def _tab_playlist_central():
             f"y serán accesibles para todo el equipo."
         )
     else:
-        st.warning(
-            "No se pudo verificar la cuenta central. "
-            "El token puede haber expirado o ser inválido. "
-            "Contacta al administrador para regenerar SPOTIFY_CENTRAL_REFRESH_TOKEN."
-        )
+        if _is_admin(st.session_state.get("user_email", "")):
+            st.warning(
+                "No se pudo verificar la cuenta central. "
+                "El token puede haber expirado, ser inválido o que SPOTIFY_CLIENT_ID/SPOTIFY_CLIENT_SECRET "
+                "hayan cambiado. Ve a la pestaña Setup, reconecta la cuenta central y actualiza "
+                "SPOTIFY_CENTRAL_REFRESH_TOKEN en Streamlit Secrets."
+            )
+            _det = st.session_state.get("sp_last_error")
+            if _det:
+                st.caption(f"🔎 Detalle Spotify: {_det}")
+        else:
+            st.warning(
+                "El servicio de Spotify no está disponible en este momento. "
+                "Contacta al administrador (victor.gimenez@musicadders.com)."
+            )
         return
 
     # Fuente de ISRCs
@@ -1469,17 +1540,44 @@ def _tab_playlist_central():
         pl = spotify_create_playlist(pl_name.strip(), pl_desc.strip(), pl_public)
 
     if pl is None:
-        tok_check = central_get_access_token()
-        if not tok_check:
-            st.error(
-                "Error 401: el token central ha expirado o es inválido. "
-                "Regenera SPOTIFY_CENTRAL_REFRESH_TOKEN en Streamlit Secrets."
-            )
+        _is_adm = _is_admin(st.session_state.get("user_email", ""))
+        _msg_contact = (
+            "El servicio de Spotify necesita reconexión. "
+            "Contacta al administrador (victor.gimenez@musicadders.com)."
+        )
+        _msg_dead = (
+            "El refresh token de Spotify ha caducado (política Spotify: 6 meses). "
+            "Ve a la pestaña Setup, reconecta la cuenta central Spotify y pega el nuevo "
+            "SPOTIFY_CENTRAL_REFRESH_TOKEN en Streamlit Secrets (share.streamlit.io → Settings → Secrets). "
+            "Verifica también que SPOTIFY_CLIENT_ID y SPOTIFY_CLIENT_SECRET no hayan cambiado."
+        )
+        if st.session_state.get("spotify_central_token_dead"):
+            st.error(_msg_dead if _is_adm else _msg_contact)
         else:
-            st.error(
-                "No se pudo crear la playlist (error desconocido). "
-                "Puede ser un 403 (permisos) o un problema temporal. Inténtalo de nuevo."
-            )
+            tok_check = central_get_access_token()
+            # central_get_access_token() puede marcar el token muerto si el refresh
+            # devuelve invalid_grant justo durante este diagnóstico → re-leer el flag
+            # para mostrar el mensaje preciso en lugar del 401 genérico.
+            if st.session_state.get("spotify_central_token_dead"):
+                st.error(_msg_dead if _is_adm else _msg_contact)
+            elif not tok_check:
+                if _is_adm:
+                    st.error(
+                        "Error 401: el token central ha expirado o es inválido. "
+                        "Regenera SPOTIFY_CENTRAL_REFRESH_TOKEN en Streamlit Secrets. "
+                        "Verifica también SPOTIFY_CLIENT_ID y SPOTIFY_CLIENT_SECRET."
+                    )
+                else:
+                    st.error(_msg_contact)
+            else:
+                _det = st.session_state.get("sp_last_error", "")
+                if _det:
+                    st.error(f"No se pudo crear la playlist. Spotify respondió → {_det}")
+                else:
+                    st.error(
+                        "No se pudo crear la playlist (error desconocido). "
+                        "Puede ser un 403 (permisos) o un problema temporal. Inténtalo de nuevo."
+                    )
         return
 
     playlist_id = pl.get("id")
@@ -1524,7 +1622,31 @@ def _tab_playlist_central():
             if r.status_code == 401 and attempts == 1:
                 new_tok = central_refresh_access_token()
                 if not new_tok:
-                    _fatal_error = "401 — token central expiró sin posibilidad de renovación. Regenera SPOTIFY_CENTRAL_REFRESH_TOKEN."
+                    _is_adm_add = _is_admin(st.session_state.get("user_email", ""))
+                    if st.session_state.get("spotify_central_token_dead"):
+                        if _is_adm_add:
+                            _fatal_error = (
+                                "El refresh token de Spotify ha caducado (política Spotify: 6 meses). "
+                                "Ve a la pestaña Setup, reconecta la cuenta central y pega el nuevo "
+                                "SPOTIFY_CENTRAL_REFRESH_TOKEN en Streamlit Secrets. "
+                                "Verifica también SPOTIFY_CLIENT_ID y SPOTIFY_CLIENT_SECRET."
+                            )
+                        else:
+                            _fatal_error = (
+                                "El servicio de Spotify necesita reconexión. "
+                                "Contacta al administrador (victor.gimenez@musicadders.com)."
+                            )
+                    else:
+                        if _is_adm_add:
+                            _fatal_error = (
+                                "401 — token central expiró sin posibilidad de renovación. "
+                                "Regenera SPOTIFY_CENTRAL_REFRESH_TOKEN en Streamlit Secrets."
+                            )
+                        else:
+                            _fatal_error = (
+                                "El servicio de Spotify necesita reconexión. "
+                                "Contacta al administrador (victor.gimenez@musicadders.com)."
+                            )
                     break
                 tok_add = new_tok
                 continue
