@@ -60,8 +60,9 @@ SPOTIFY_SCOPES = "playlist-modify-public playlist-modify-private user-read-priva
 SPOTIFY_RA_ABORT_THRESHOLD = 120          # segundos
 # Token-bucket global: intervalo mínimo entre requests (~1.67 req/s sostenido).
 SPOTIFY_MIN_REQ_INTERVAL = 0.60          # segundos entre requests (shared entre workers)
-# Tope de ISRCs por lote: por encima se avisa al usuario (riesgo de timeout 24h).
-SPOTIFY_SAFE_BATCH_WARN = 200            # ISRCs
+# ISRCs por encima de los cuales se muestra nota informativa sobre cupo diario.
+# El freno real es el ritmo (SPOTIFY_MIN_REQ_INTERVAL), no el recuento.
+SPOTIFY_SAFE_BATCH_WARN = 300            # ISRCs
 # Techo de cooldown: evita que un Retry-After anómalo congele la app días enteros.
 # La decisión de abortar el lote se sigue tomando con wait_secs real vs umbral.
 SPOTIFY_MAX_COOLDOWN = 7200              # segundos (2h máximo de cooldown registrado)
@@ -117,6 +118,18 @@ def _sp_cooldown_msg(cd_until: float) -> tuple[int, str]:
     except Exception:
         hora = datetime.utcfromtimestamp(cd_until).strftime("%H:%M UTC")
     return mins, hora
+
+
+def _fmt_eta(segundos: float) -> str:
+    """Formatea una duración estimada de forma legible ('~3 min', '~45 s').
+
+    Usa ceil para los minutos (sin +1 artificial):
+      60s → '~1 min', 186s → '~4 min', 45s → '~45 s'.
+    """
+    import math
+    if segundos >= 60:
+        return f"~{max(1, math.ceil(segundos / 60))} min"
+    return f"~{max(1, int(segundos))} s"
 
 
 def _is_admin(user_email: str) -> bool:
@@ -1667,14 +1680,19 @@ def _tab_playlist_central():
         )
     isrcs = isrcs_uniq
 
-    # Aviso si el lote supera el umbral seguro (riesgo timeout 24h de Spotify).
-    # El aviso es accionable: se dan instrucciones concretas.
-    if len(isrcs) > SPOTIFY_SAFE_BATCH_WARN:
-        st.warning(
-            f"El lote tiene {len(isrcs)} ISRCs y supera el límite recomendado de {SPOTIFY_SAFE_BATCH_WARN}. "
-            "Con lotes grandes, Spotify puede pausar las peticiones durante horas. "
-            f"**Divide el CSV en lotes de ≤ {SPOTIFY_SAFE_BATCH_WARN} ISRCs** y envía el siguiente "
-            "cuando termine el primero."
+    # Estimación de tiempo para lotes no triviales: evita que parezca colgado.
+    # Para lotes grandes (> SPOTIFY_SAFE_BATCH_WARN) se usa st.info; para lotes
+    # medianos (> 50) se muestra como st.caption junto al formulario.
+    # El cálculo es conservador: n_isrcs × intervalo del token-bucket.
+    _n_isrcs = len(isrcs)
+    _eta_seg = _n_isrcs * SPOTIFY_MIN_REQ_INTERVAL
+    _eta_txt = _fmt_eta(_eta_seg)
+    if _n_isrcs > SPOTIFY_SAFE_BATCH_WARN:
+        st.info(
+            f"Este lote tiene {_n_isrcs:,} ISRCs (~{_eta_txt}). "
+            "Lotes muy grandes pueden consumir el cupo diario de búsqueda de Spotify; "
+            "si vas a hacerlo a menudo, conviene solicitar Extended Quota Mode. "
+            "Puedes dejarlo correr sin problema."
         )
 
     # Gate de cooldown: capturar bajo lock (TOCTOU) y mostrar aviso con botón deshabilitado.
@@ -1705,6 +1723,13 @@ def _tab_playlist_central():
         create_btn = st.button(
             "🎵 Crear playlist", type="primary", width="stretch",
             disabled=_gate_paused,
+        )
+
+    # Caption de ETA fuera de col_p para no truncarse en la columna estrecha.
+    # Se muestra para lotes ≥ 50 ISRCs donde la espera es perceptible.
+    if _n_isrcs >= 50:
+        st.caption(
+            f"Tardará aproximadamente {_eta_txt} — puedes esperar en esta misma pantalla."
         )
 
     if not create_btn:
