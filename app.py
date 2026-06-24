@@ -34,7 +34,9 @@ import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import bcrypt
 import pandas as pd
@@ -51,6 +53,70 @@ from cards import _build_card_html
 MAX_BATCH_ISRCS = 500
 SPOTIFY_SCOPES = "playlist-modify-public playlist-modify-private user-read-private user-read-email"
 # SPOTIFY_CENTRAL_MODE = True  # legacy flag, modo central es ahora obligatorio
+
+# ── Política anti-penalty-box (Spotify Dev Mode) ─────────────────────────────
+# Retry-After por encima de este umbral → abortar el lote (penalty box de horas).
+# Por debajo → esperar exacto y reintentar (máx 2 veces más).
+SPOTIFY_RA_ABORT_THRESHOLD = 120          # segundos
+# Token-bucket global: intervalo mínimo entre requests (~1.67 req/s sostenido).
+SPOTIFY_MIN_REQ_INTERVAL = 0.60          # segundos entre requests (shared entre workers)
+# Tope de ISRCs por lote: por encima se avisa al usuario (riesgo de timeout 24h).
+SPOTIFY_SAFE_BATCH_WARN = 200            # ISRCs
+# Techo de cooldown: evita que un Retry-After anómalo congele la app días enteros.
+# La decisión de abortar el lote se sigue tomando con wait_secs real vs umbral.
+SPOTIFY_MAX_COOLDOWN = 7200              # segundos (2h máximo de cooldown registrado)
+
+# Estado de cooldown global (persiste entre reruns de Streamlit en el mismo proceso).
+# Protegido con lock porque _resolve_one corre en hilos worker.
+_SP_COOLDOWN: dict[str, float] = {"until": 0.0}
+_SP_COOLDOWN_LOCK = threading.Lock()
+
+# Token-bucket module-level: timestamp del último request emitido.
+# Garantiza que no haya burst entre workers al arrancar a la vez.
+_SP_LAST_REQ: dict[str, float] = {"t": 0.0}
+_SP_LAST_REQ_LOCK = threading.Lock()
+
+# Número máximo de intentos por ISRC en _resolve_one.
+_SP_MAX_ATTEMPTS = 3
+
+
+def _parse_retry_after(ra: str | None, default: int = 5) -> int:
+    """Parsea la cabecera Retry-After de Spotify.
+
+    Soporta:
+    - Entero: "60"
+    - Float: "3600.0"  (Spotify a veces devuelve decimales)
+    - Fecha HTTP RFC 7231: "Wed, 21 Oct 2025 07:28:00 GMT"
+
+    Devuelve siempre un entero ≥ 1. Si no se puede parsear, devuelve `default`.
+    """
+    if not ra:
+        return default
+    ra = ra.strip()
+    try:
+        return max(1, int(float(ra)))
+    except (ValueError, TypeError):
+        pass
+    try:
+        dt = parsedate_to_datetime(ra)
+        return max(1, int(dt.timestamp() - time.time()))
+    except Exception:
+        return default
+
+
+def _sp_cooldown_msg(cd_until: float) -> tuple[int, str]:
+    """Devuelve (mins_restantes, hora_madrid) a partir de un epoch de fin de pausa.
+
+    El servidor corre en UTC; se convierte a Europe/Madrid para mostrar al operador
+    una hora de reloj reconocible. `mins` es el dato principal, la hora es complementaria.
+    """
+    remaining = max(0.0, cd_until - time.time())
+    mins = int(remaining // 60) + 1
+    try:
+        hora = datetime.fromtimestamp(cd_until, tz=ZoneInfo("Europe/Madrid")).strftime("%H:%M")
+    except Exception:
+        hora = datetime.utcfromtimestamp(cd_until).strftime("%H:%M UTC")
+    return mins, hora
 
 
 def _is_admin(user_email: str) -> bool:
@@ -668,19 +734,37 @@ def spotify_find_uri_by_isrc(isrc: str) -> str | None:
 
 
 def spotify_resolve_isrcs(isrcs: list[str], progress_cb=None,
-                           max_workers: int = 2) -> dict:
+                           max_workers: int = 1) -> dict:
     """Resuelve ISRCs → URIs Spotify en paralelo, preservando orden.
 
-    Política conservadora anti-penalty-box (Spotify Development Mode tiene
-    límites de rate MUY bajos; 6 hilos a ~30 req/s disparaban 429 en lote):
-    - 2 workers paralelos máximo (≈3-4 req/s pico).
-    - Throttle proactivo per-worker (~500ms ± jitter) para ritmo sostenido bajo.
-    - Retry-After respetado hasta 60s (Spotify a veces pide esperas largas
-      y capear bajo ese valor activa penalty box).
-    - Cooldown global compartido en 429 + reintentos limitados.
-    Para lotes grandes de forma fiable hace falta Extended Quota Mode (quita el
-    límite de 25 users y sube el rate); se solicita en el dashboard de Spotify.
+    Política anti-penalty-box (Spotify Development Mode tiene límites muy bajos):
+    - 1 worker por defecto; ritmo sostenido ≤ 2-3 req/s via token-bucket global.
+    - ISRCs deduplicados por el caller antes de entrar.
+    - 429 con Retry-After ≤ SPOTIFY_RA_ABORT_THRESHOLD → espera exacta + reintenta.
+    - 429 con Retry-After > SPOTIFY_RA_ABORT_THRESHOLD (penalty box de horas) →
+      ABORTA el lote limpiamente; devuelve stopped=True con cooldown_until.
+    - Cooldown module-level (_SP_COOLDOWN) persiste entre reruns y entre usuarios
+      del mismo contenedor; el gate al inicio de esta función aborta sin llamar
+      a Spotify si el cooldown sigue activo.
     """
+    # Gate de cooldown global: no llamar a Spotify si seguimos en pausa.
+    # Capturamos cd_until bajo el lock para evitar TOCTOU.
+    with _SP_COOLDOWN_LOCK:
+        cd_until = _SP_COOLDOWN["until"]
+    remaining = cd_until - time.time()
+    if remaining > 0:
+        mins, hora = _sp_cooldown_msg(cd_until)
+        return {
+            "uris": [], "not_found": [],
+            "errors": [(i, "pausa activa") for i in isrcs],
+            "stopped": True,
+            "reason": (
+                f"Spotify ha pausado temporalmente las peticiones (~{mins} min más, "
+                f"hasta las {hora} hora de Madrid). Reintenta cuando pase ese tiempo."
+            ),
+            "cooldown_until": cd_until,
+        }
+
     tok = spotify_client_credentials_token()
     if not tok:
         return {"uris": [], "not_found": [], "errors": [(i, "no CC token") for i in isrcs],
@@ -709,11 +793,12 @@ def spotify_resolve_isrcs(isrcs: list[str], progress_cb=None,
 
     lock = threading.Lock()
     tok_ref = {"v": tok}
-    # Si Spotify nos manda un 429 con Retry-After largo, pausamos todos
-    # los hilos en lugar de que cada uno espere de forma independiente.
-    cooldown_until = {"t": 0.0}
+    # _abort_event: si un worker detecta pausa larga (RA > umbral), señaliza
+    # al resto para que no emitan más requests y salgan rápido.
+    # Se crea por llamada para no arrastrar abort de lotes anteriores.
+    _abort_event = threading.Event()
     # Diagnóstico: loguea el motivo REAL de los primeros errores de resolución
-    # (status de Spotify) para distinguir 429/penalty-box de 403/otros.
+    # (status de Spotify) para distinguir 429 de penalty-box, 403, etc.
     _err_diag = {"n": 0}
 
     def _log_err(isrc: str, reason: str) -> None:
@@ -724,20 +809,33 @@ def spotify_resolve_isrcs(isrcs: list[str], progress_cb=None,
 
     def _resolve_one(isrc: str) -> tuple[str, str, str | None]:
         """(isrc, kind, value). kind ∈ {'uri','notfound','error'}."""
+        # Comprobar abort antes de empezar (otro worker pudo activarlo)
+        if _abort_event.is_set():
+            return (isrc, "error", "aborted")
         attempts = 0
-        # Throttle proactivo inicial con jitter para evitar burst sincronizado
-        # entre workers cuando arrancan a la vez. Sin esto, los N workers
-        # disparan a la vez al inicio y Spotify ve un pico de N req simultáneas.
-        time.sleep(random.uniform(0.0, 0.2))
-        while attempts < 4:
+        while attempts < _SP_MAX_ATTEMPTS:
             attempts += 1
-            # Throttle proactivo per-request: ritmo sostenido seguro
-            # 2 workers × 1 req cada ~500ms ≈ 3-4 req/s pico (Dev Mode)
-            time.sleep(0.5 + random.uniform(-0.1, 0.1))
-            # Respeta cooldown global si está activo
-            wait_global = cooldown_until["t"] - time.time()
-            if wait_global > 0:
-                time.sleep(min(wait_global, 60))
+            # Token-bucket global compartido entre workers: garantiza ritmo
+            # sostenido ≤ 1/SPOTIFY_MIN_REQ_INTERVAL req/s sin burst al inicio.
+            # IMPORTANTE: el sleep va FUERA del lock para no bloquearlo durante
+            # la espera (otros workers deben poder reservar su slot mientras dormimos).
+            with _SP_LAST_REQ_LOCK:
+                elapsed = time.time() - _SP_LAST_REQ["t"]
+                gap = SPOTIFY_MIN_REQ_INTERVAL - elapsed
+                # Reservamos el slot ANTES de soltar el lock para que el siguiente
+                # worker vea el timestamp ya actualizado y no calcule el mismo gap.
+                _SP_LAST_REQ["t"] = time.time() + max(gap, 0.0)
+            if gap > 0:
+                time.sleep(gap)
+            # Jitter pequeño para no sincronizar workers en el bucket exacto
+            time.sleep(random.uniform(0.0, 0.05))
+            # Respetar cooldown global si otro hilo lo activó mientras esperábamos
+            with _SP_COOLDOWN_LOCK:
+                cd_now = _SP_COOLDOWN["until"]
+            if cd_now - time.time() > 0:
+                # Pausa activa: abandonar sin dormir horas en el worker
+                _abort_event.set()
+                return (isrc, "error", "pausa activa")
             with lock:
                 cur_tok = tok_ref["v"]
             try:
@@ -751,7 +849,7 @@ def spotify_resolve_isrcs(isrcs: list[str], progress_cb=None,
                 # Caída de conexión (RemoteDisconnected, etc.): transitoria →
                 # reintenta en conexión nueva en vez de rendirse al primer fallo.
                 _log_err(isrc, f"net: {str(e)[:80]}")
-                if attempts <= 3:
+                if attempts < _SP_MAX_ATTEMPTS:
                     try:
                         _tls.sess = None  # fuerza sesión/conexión nueva en el reintento
                     except Exception:
@@ -780,30 +878,40 @@ def spotify_resolve_isrcs(isrcs: list[str], progress_cb=None,
 
             if r.status_code == 429:
                 ra = r.headers.get("Retry-After")
-                try:
-                    # Cap a 60s: si Spotify pide más, ya estamos cerca de penalty
-                    # box y conviene esperar lo que diga (mejor que reintentar pronto
-                    # y empeorar). Cap superior evita esperas absurdas si la API
-                    # devuelve un número raro.
-                    wait = min(int(ra), 60) if ra else 5
-                except ValueError:
-                    wait = 5
-                # Cooldown global: el resto de hilos lo respeta y no martillean Spotify
-                cooldown_until["t"] = max(cooldown_until["t"], time.time() + wait)
-                # Backoff exponencial añadido en reintentos sucesivos para no
-                # martillear si el cooldown global no alcanza
-                time.sleep(wait + (2 ** attempts) * 0.1)
+                wait_secs = _parse_retry_after(ra)
+                now = time.time()
+                # Techo de cooldown: nunca registrar más de SPOTIFY_MAX_COOLDOWN
+                # independientemente del Retry-After real (evita congelación días).
+                # La decisión de abortar usa wait_secs real vs umbral.
+                with _SP_COOLDOWN_LOCK:
+                    _SP_COOLDOWN["until"] = max(
+                        _SP_COOLDOWN["until"],
+                        min(now + wait_secs, now + SPOTIFY_MAX_COOLDOWN),
+                    )
+                if wait_secs > SPOTIFY_RA_ABORT_THRESHOLD:
+                    # Pausa larga: abortar el lote limpiamente.
+                    # NO dormimos en el worker; el gate module-level impedirá
+                    # nuevas llamadas hasta que expire la pausa.
+                    _log_err(isrc, f"429 pausa larga: {wait_secs}s > umbral, abortando lote")
+                    _abort_event.set()
+                    return (isrc, "error", "pausa larga")
+                # Pausa corta (≤ umbral): esperar exacto y reintentar
+                _log_err(isrc, f"429 espera {wait_secs}s (intento {attempts})")
+                if progress_cb:
+                    # Feedback al UI para que el spinner no parezca colgado
+                    pass  # progress_cb no disponible en worker; se actualiza via as_completed
+                time.sleep(wait_secs)
                 continue
 
-            if 500 <= r.status_code < 600 and attempts <= 2:
+            if 500 <= r.status_code < 600 and attempts < _SP_MAX_ATTEMPTS:
                 time.sleep(2 * attempts)
                 continue
 
             _log_err(isrc, f"http {r.status_code}: {(r.text or '')[:180]}")
             return (isrc, "error", f"http {r.status_code}")
 
-        _log_err(isrc, "rate-limited 429 (agotados 4 intentos con backoff)")
-        return (isrc, "error", "rate-limited (4 intentos)")
+        _log_err(isrc, f"demasiados reintentos ({_SP_MAX_ATTEMPTS}) sin éxito")
+        return (isrc, "error", f"reintentos agotados ({_SP_MAX_ATTEMPTS})")
 
     results: dict[str, tuple[str, str, str | None]] = {}
     completed = 0
@@ -856,8 +964,25 @@ def spotify_resolve_isrcs(isrcs: list[str], progress_cb=None,
         else:
             errors.append((isrc, val or "?"))
 
+    # Si algún worker activó la pausa larga, propagar estado claro al UI.
+    if _abort_event.is_set():
+        with _SP_COOLDOWN_LOCK:
+            cd_until = _SP_COOLDOWN["until"]
+        mins, hora = _sp_cooldown_msg(cd_until)
+        return {
+            "uris": uris, "not_found": not_found, "errors": errors,
+            "stopped": True,
+            "reason": (
+                f"Spotify ha pausado temporalmente las peticiones (~{mins} min más, "
+                f"hasta las {hora} hora de Madrid). "
+                "No se ha creado ninguna playlist y no se ha perdido nada: "
+                f"puedes reintentar con los mismos ISRCs cuando pase ese tiempo."
+            ),
+            "cooldown_until": cd_until,
+        }
+
     return {"uris": uris, "not_found": not_found, "errors": errors,
-            "stopped": False, "reason": ""}
+            "stopped": False, "reason": "", "cooldown_until": 0.0}
 
 
 def spotify_create_playlist(name: str, description: str = "", public: bool = False) -> dict | None:
@@ -1527,6 +1652,46 @@ def _tab_playlist_central():
     if not isrcs:
         return
 
+    # Deduplicar ISRCs preservando el primer orden de aparición.
+    # Resolver solo los únicos reduce requests a Spotify y el riesgo de rate-limit.
+    _seen: set[str] = set()
+    isrcs_uniq: list[str] = []
+    for _i in isrcs:
+        if _i not in _seen:
+            _seen.add(_i)
+            isrcs_uniq.append(_i)
+    if len(isrcs_uniq) < len(isrcs):
+        st.caption(
+            f"Se eliminaron {len(isrcs) - len(isrcs_uniq)} ISRCs duplicados "
+            f"({len(isrcs_uniq)} únicos a resolver)."
+        )
+    isrcs = isrcs_uniq
+
+    # Aviso si el lote supera el umbral seguro (riesgo timeout 24h de Spotify).
+    # El aviso es accionable: se dan instrucciones concretas.
+    if len(isrcs) > SPOTIFY_SAFE_BATCH_WARN:
+        st.warning(
+            f"El lote tiene {len(isrcs)} ISRCs y supera el límite recomendado de {SPOTIFY_SAFE_BATCH_WARN}. "
+            "Con lotes grandes, Spotify puede pausar las peticiones durante horas. "
+            f"**Divide el CSV en lotes de ≤ {SPOTIFY_SAFE_BATCH_WARN} ISRCs** y envía el siguiente "
+            "cuando termine el primero."
+        )
+
+    # Gate de cooldown: capturar bajo lock (TOCTOU) y mostrar aviso con botón deshabilitado.
+    # No salir en silencio: el formulario permanece visible pero el botón no funciona.
+    with _SP_COOLDOWN_LOCK:
+        _gate_cd_until = _SP_COOLDOWN["until"]
+    _gate_cd_remaining = _gate_cd_until - time.time()
+    _gate_paused = _gate_cd_remaining > 0
+
+    if _gate_paused:
+        _gate_mins, _gate_hora = _sp_cooldown_msg(_gate_cd_until)
+        st.info(
+            f"Spotify ha pausado temporalmente las peticiones. "
+            f"Podrás crear la playlist en aproximadamente **{_gate_mins} min** "
+            f"(hacia las {_gate_hora} hora de Madrid). Recarga la página entonces."
+        )
+
     st.markdown("##### Detalles de la playlist")
     col_n, col_p = st.columns([3, 1])
     with col_n:
@@ -1537,7 +1702,10 @@ def _tab_playlist_central():
     with col_p:
         pl_public = st.checkbox("Pública", value=False,
                                 help="Si NO la marcas, será privada en la cuenta Spotify central.")
-        create_btn = st.button("🎵 Crear playlist", type="primary", width="stretch")
+        create_btn = st.button(
+            "🎵 Crear playlist", type="primary", width="stretch",
+            disabled=_gate_paused,
+        )
 
     if not create_btn:
         return
@@ -1566,7 +1734,8 @@ def _tab_playlist_central():
     c3.metric("Errores", len(errors))
 
     if resolve_result.get("stopped"):
-        st.error(f"Resolución abortada: {resolve_result.get('reason', '')}")
+        # El mensaje ya viene limpio y listo para el operador desde spotify_resolve_isrcs
+        st.warning(resolve_result.get("reason", "Spotify pausó las peticiones. Reintenta en unos minutos."))
         return
 
     if not uris:
@@ -1656,6 +1825,10 @@ def _tab_playlist_central():
                 break
             if r.status_code in (200, 201):
                 added += len(chunk)
+                # Throttle entre chunks: espaciar los POST para no provocar un 429
+                # evitable en lotes con varios chunks consecutivos.
+                if chunk_idx < chunks_total - 1:
+                    time.sleep(SPOTIFY_MIN_REQ_INTERVAL)
                 break
             if r.status_code == 401 and attempts == 1:
                 new_tok = central_refresh_access_token()
@@ -1694,21 +1867,49 @@ def _tab_playlist_central():
             if r.status_code == 403:
                 _fatal_error = "403 — la cuenta central no tiene permisos suficientes para añadir tracks."
                 break
-            if r.status_code == 429 and attempts <= 3:
-                ra = r.headers.get("Retry-After")
-                try:
-                    wait = min(int(ra), 30) if ra else 5
-                except ValueError:
-                    wait = 5
-                time.sleep(wait)
-                continue
             if r.status_code == 429:
-                _fatal_error = f"429 persistente en chunk {chunk_idx}/{chunks_total} tras {attempts} intentos."
+                ra = r.headers.get("Retry-After")
+                wait_secs = _parse_retry_after(ra)
+                now = time.time()
+                # Actualizar cooldown global con techo (mismo mecanismo que _resolve_one)
+                with _SP_COOLDOWN_LOCK:
+                    _SP_COOLDOWN["until"] = max(
+                        _SP_COOLDOWN["until"],
+                        min(now + wait_secs, now + SPOTIFY_MAX_COOLDOWN),
+                    )
+                if wait_secs > SPOTIFY_RA_ABORT_THRESHOLD:
+                    # Pausa larga: abortar el añadido limpiamente.
+                    with _SP_COOLDOWN_LOCK:
+                        cd_until_add = _SP_COOLDOWN["until"]
+                    mins_add, hora_add = _sp_cooldown_msg(cd_until_add)
+                    _fatal_error = (
+                        f"Spotify ha pausado temporalmente las peticiones (~{mins_add} min más, "
+                        f"hasta las {hora_add} hora de Madrid). "
+                        f"La playlist quedó incompleta ({added:,} de {len(total_uris):,} canciones). "
+                        "Puedes abrirla, borrarla y reintentar completa cuando pase ese tiempo."
+                    )
+                    break
+                if attempts <= 2:
+                    # Pausa corta: esperar exacto y reintentar
+                    add_prog.progress(
+                        (chunk_idx) / chunks_total,
+                        text=f"Spotify pidió esperar {wait_secs}s… ({added:,}/{len(total_uris):,} añadidos)",
+                    )
+                    time.sleep(wait_secs)
+                    continue
+                _fatal_error = (
+                    f"Spotify no respondió después de {attempts} intentos en el lote {chunk_idx + 1}/"
+                    f"{chunks_total}. La playlist puede estar incompleta."
+                )
                 break
-            # Cualquier otro código (5xx, etc.)
+            if 500 <= r.status_code < 600 and attempts <= 2:
+                # Error transitorio del servidor de Spotify: reintentar
+                time.sleep(2 * attempts)
+                continue
+            # Cualquier otro código inesperado
             _fatal_error = (
-                f"add-tracks falló HTTP {r.status_code} en chunk {chunk_idx}/{chunks_total} "
-                f"tras {attempts} intentos."
+                f"Error inesperado al añadir canciones (lote {chunk_idx + 1}/{chunks_total}). "
+                "La playlist puede estar incompleta."
             )
             break
         add_prog.progress((chunk_idx + 1) / chunks_total,
@@ -1716,10 +1917,11 @@ def _tab_playlist_central():
         if _fatal_error:
             add_prog.empty()
             pl_url = (pl.get("external_urls") or {}).get("spotify") or ""
-            link_md = f" [Abrir en Spotify]({pl_url})" if pl_url else ""
+            link_txt = f"[Abrir en Spotify]({pl_url})" if pl_url else ""
             st.warning(
-                f"⚠️ Playlist creada PARCIAL: se añadieron {added:,} de {len(total_uris):,} tracks. "
-                f"Causa: {_fatal_error}.{link_md}"
+                f"La playlist quedó **incompleta**: se añadieron {added:,} de {len(total_uris):,} canciones. "
+                f"{_fatal_error}"
+                + (f" {link_txt}" if link_txt else "")
             )
             return
 
