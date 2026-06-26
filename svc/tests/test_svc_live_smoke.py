@@ -261,3 +261,121 @@ def test_live_svc_search_isrc_invalido_da_422():
             "401 → token incorrecto en web/.env.local o svc usa token diferente.\n"
             "404 → svc no reiniciado tras desplegar /search (F2)."
         )
+
+
+# ── Tests de regresión F3 FUGA (smoke vivo) ──────────────────────────────────
+
+def test_live_svc_expone_rutas_fuga():
+    """
+    REGRESION F3: los endpoints FUGA deben estar registrados en el svc en vivo.
+
+    Fallo → svc arrancado ANTES de desplegar F3. Solución: reiniciar uvicorn.
+    Rutas esperadas: /fuga, /fuga/{job_id}/status, /fuga/{job_id}/result.json
+    """
+    routes = _get_live_routes()
+    fuga_routes = [
+        "/fuga",
+        "/fuga/{job_id}/status",
+        "/fuga/{job_id}/result.json",
+        "/fuga/{job_id}/result.csv",
+        "/fuga/{job_id}/result.xlsx",
+        "/fuga/{job_id}/cancel",
+    ]
+    for r in fuga_routes:
+        assert r in routes, (
+            f"FAIL — {r} (F3 FUGA) no está en el svc en vivo. Rutas actuales: {routes}\n"
+            "CAUSA: el proceso uvicorn se arrancó ANTES de desplegar F3.\n"
+            "SOLUCIÓN: pkill -f 'uvicorn svc.main' && "
+            "cd /Users/trabajo/musicadders-buscador && "
+            "INTERNAL_TOKEN=devtoken .venv/bin/uvicorn svc.main:app --host 127.0.0.1 --port 8600"
+        )
+
+
+def test_live_svc_fuga_sin_token_da_401():
+    """
+    REGRESION F3: POST /fuga sin X-Internal-Token → 401 (fail-closed).
+
+    404 → svc no reiniciado tras desplegar F3.
+    200 → auth roto.
+    """
+    data = json.dumps({"date_from": "2024-01-01", "date_to": "2024-01-31"}).encode()
+    req = urllib.request.Request(
+        f"{_SVC_BASE}/fuga",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5):
+            pytest.fail("Sin token esperado 401, pero el svc respondió 200")
+    except urllib.error.HTTPError as e:
+        assert e.code == 401, (
+            f"Sin token esperado 401, obtenido {e.code}.\n"
+            "404 → svc no reiniciado; 200 → auth roto."
+        )
+
+
+def test_live_svc_fuga_job_id_invalido_da_400():
+    """
+    REGRESION F3: GET /fuga/{job_id_invalido}/status → 400 (defensa path traversal).
+
+    job_ids inválidos (no UUID) deben ser rechazados antes de tocar el job-store.
+    Protege contra path traversal e inyección.
+    """
+    token = _read_token_from_env_local()
+    invalid_ids = ["not-a-uuid", "fake-id", "..malicious..", "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"]
+    for bad_id in invalid_ids:
+        url = f"{_SVC_BASE}/fuga/{bad_id}/status"
+        req = urllib.request.Request(url, headers={"X-Internal-Token": token})
+        try:
+            with urllib.request.urlopen(req, timeout=5):
+                pytest.fail(f"job_id='{bad_id}' esperado 400, pero el svc respondió 200")
+        except urllib.error.HTTPError as e:
+            assert e.code == 400, (
+                f"job_id='{bad_id}' esperado 400 (formato inválido), obtenido {e.code}.\n"
+                "La validación _validate_job_id debe rechazar IDs no-UUID antes del auth."
+            )
+
+
+def test_live_svc_fuga_sin_credenciales_da_401_no_credentials():
+    """
+    REGRESION F3: POST /fuga con token válido pero sin FUGA_USER/FUGA_PASS
+    en el entorno del svc → 401 con {error: 'no_credentials'}.
+
+    Fail-closed: el endpoint no crea el job si las credenciales FUGA no están
+    configuradas. La prueba documenta el comportamiento esperado en staging/CI
+    donde FUGA_USER/FUGA_PASS no están definidas.
+
+    Si el svc tiene FUGA_USER/FUGA_PASS reales, este test devolverá 202
+    (job creado) y se omite la aserción de no_credentials.
+    """
+    token = _read_token_from_env_local()
+    data = json.dumps({"date_from": "2024-01-01", "date_to": "2024-01-31"}).encode()
+    req = urllib.request.Request(
+        f"{_SVC_BASE}/fuga",
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "X-Internal-Token": token,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            # Si llegamos aquí, las credenciales FUGA están presentes → 202 aceptable
+            body = json.loads(r.read())
+            assert r.status == 202, f"Con credenciales FUGA esperado 202, obtenido {r.status}"
+            assert "job_id" in body, f"202 pero sin job_id: {body}"
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            body = json.loads(e.read())
+            assert body.get("error") == "no_credentials", (
+                f"401 esperado con error='no_credentials', obtenido: {body}"
+            )
+            # PASS: fail-closed confirmado
+        else:
+            pytest.fail(
+                f"POST /fuga con token válido devolvió {e.code} inesperado.\n"
+                "422 → fechas inválidas (no debería ocurrir con este payload).\n"
+                "503 → INTERNAL_TOKEN no configurado en el svc."
+            )

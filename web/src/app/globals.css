@@ -125,16 +125,23 @@ body {
 /* ─── Tabla densa (reutilizable, mismo sistema que revisor-fuga) ─────────────── */
 
 .fuga-table-wrapper {
-  overflow: auto;
+  overflow: hidden;  /* clips border-radius; scroll handled by .fuga-table-scroll */
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
   background: var(--color-surface);
+}
+
+/* Contenedor de scroll horizontal separado del wrapper para que el footer
+   permanezca fijo al borde inferior sin scrollar lateralmente. */
+.fuga-table-scroll {
+  overflow-x: auto;
 }
 
 .fuga-table {
   width: 100%;
   border-collapse: collapse;
   font-size: 13px;
+  min-width: 640px;
 }
 
 .fuga-table thead {
@@ -145,7 +152,7 @@ body {
 }
 
 .fuga-table thead th {
-  padding: 10px 12px;
+  padding: 9px 12px;
   text-align: left;
   font-size: 11px;
   font-weight: 600;
@@ -157,19 +164,16 @@ body {
   user-select: none;
 }
 
-.fuga-table thead th button {
+/* Columnas ordenables: cursor pointer sobre el th directamente (sin button interno). */
+.fuga-table thead th.is-sortable { cursor: pointer; }
+.fuga-table thead th.is-sortable:hover { color: var(--color-text); }
+
+/* Wrapper del contenido del encabezado (texto + icono de sort). */
+.fuga-th-inner {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  background: none;
-  border: none;
-  padding: 0;
-  font: inherit;
-  color: inherit;
-  cursor: pointer;
 }
-
-.fuga-table thead th button:hover { color: var(--color-text); }
 
 .fuga-table tbody tr {
   border-bottom: 1px solid var(--color-border);
@@ -178,12 +182,13 @@ body {
 
 .fuga-table tbody tr:last-child { border-bottom: none; }
 
-.fuga-table tbody tr:nth-child(even) { background: var(--color-surface-raised); }
+/* Zebra via clase JSX (row index par) — más robusto que :nth-child con TanStack. */
+.fuga-table tbody tr.fuga-row-even { background: var(--color-surface-raised); }
 
 .fuga-table tbody tr:hover { background: var(--color-accent-subtle); }
 
 .fuga-table tbody td {
-  padding: 8px 12px;
+  padding: 7px 12px;
   vertical-align: middle;
   color: var(--color-text);
 }
@@ -191,7 +196,8 @@ body {
 .fuga-table .cell-code {
   font-family: var(--font-mono);
   font-size: 12px;
-  letter-spacing: 0.02em;
+  letter-spacing: 0.03em;
+  user-select: all;
 }
 
 .fuga-table .cell-text {
@@ -201,10 +207,25 @@ body {
   white-space: nowrap;
 }
 
+/* Texto secundario (sello, fecha): color suave para jerarquía visual. */
+.fuga-table .fuga-col-soft {
+  color: var(--color-text-soft);
+}
+
+/* Fila vacía (sin resultados para el filtro activo). */
+.fuga-table .fuga-empty-cell {
+  padding: 48px 16px;
+  text-align: center;
+  color: var(--color-text-muted);
+  font-size: 13px;
+}
+
 .fuga-table-footer {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
   padding: 10px 16px;
   border-top: 1px solid var(--color-border);
   background: var(--color-surface);
@@ -539,4 +560,89 @@ body {
   flex-shrink: 0;
   min-width: 28px;
   text-align: right;
+}
+
+/* ─── F3 "Catálogo FUGA" — componentes propios ──────────────────────────────── */
+
+/*
+ * Grid del panel de fechas: [Desde input] [Hasta input] [Botón Buscar].
+ * `auto` en la tercera columna deja que el botón tome su tamaño natural
+ * (mínimo ~90px vía min-width del .btn).
+ * En pantallas ≤560px se apila: cada campo ocupa el ancho completo.
+ */
+.fuga-date-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 12px;
+  align-items: end;
+}
+
+@media (max-width: 560px) {
+  .fuga-date-grid {
+    grid-template-columns: 1fr;
+  }
+  /* El botón ocupa todo el ancho en móvil (estilo block). */
+  .fuga-date-grid > *:last-child {
+    padding-top: 0; /* elimina el offset de alineación vertical (paddingTop quitado del JSX) */
+  }
+}
+
+/*
+ * Grid de los 3 filtros de texto libre (Artista / Sello / Release).
+ * 3 columnas en desktop; 1 en pantallas estrechas.
+ */
+.fuga-filter-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+
+@media (max-width: 640px) {
+  .fuga-filter-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/*
+ * Input de tipo fecha: hereda .fuga-input pero garantiza un min-width
+ * suficiente para que el valor de fecha no se trunque en el input nativo
+ * de diferentes navegadores.
+ */
+.fuga-date-input {
+  min-width: 140px;
+  /* Espacio para el icono superpuesto (16px de ancho + margen) */
+  padding-right: 34px;
+}
+
+/*
+ * Wrapper y icono de calendario superpuesto sobre el input de fecha.
+ *
+ * Técnica: el indicador nativo del browser se hace transparente (opacity:0)
+ * pero sigue siendo clickeable mediante position:absolute + right:0 + height:100%,
+ * preservando la funcionalidad de abrir el datepicker. El icono SVG .fuga-date-icon
+ * se superpone visualmente sin capturar eventos (pointer-events:none).
+ */
+.fuga-date-wrapper {
+  position: relative;
+}
+
+.fuga-date-icon {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  pointer-events: none;
+  color: var(--color-text-muted);
+  display: flex;
+  align-items: center;
+}
+
+.fuga-date-input::-webkit-calendar-picker-indicator {
+  opacity: 0;
+  width: 24px;
+  cursor: pointer;
+  position: absolute;
+  right: 0;
+  top: 0;
+  height: 100%;
 }

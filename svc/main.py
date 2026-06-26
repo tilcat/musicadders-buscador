@@ -40,6 +40,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
 
 # Patrón de job_id válido: UUID4 canónico (8-4-4-4-12 hex, separados por guiones)
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -120,15 +121,28 @@ async def _lifespan(app: FastAPI):
     Al apagar, espera a que el pool de workers termine los jobs en curso
     (shutdown graceful). Timeout implícito del sistema operativo.
     """
-    # Startup: nada especial (DB y pool se inicializan al importar jobs.py)
+    # Startup: limpiar jobs FUGA antiguos para evitar crecimiento ilimitado de svc/data/fuga_results/
+    from svc import fuga_jobs as _fuga_jobs_startup
+    try:
+        n = _fuga_jobs_startup.cleanup_old_jobs(max_age_days=30)
+        if n:
+            logger.info("svc: cleanup eliminó %d jobs FUGA antiguos al arrancar.", n)
+    except Exception as exc:
+        logger.warning("svc: error en cleanup de jobs FUGA al arrancar: %s", exc)
     yield
     # Shutdown: cancel_futures=True, wait=False (no espera llamadas HTTP largas)
     from svc import jobs
+    from svc import fuga_jobs
     try:
         jobs.shutdown_pool()
-        logger.info("svc: pool de workers cerrado correctamente.")
+        logger.info("svc: pool de workers batch cerrado correctamente.")
     except Exception as exc:
-        logger.warning("svc: error al cerrar el pool de workers: %s", exc)
+        logger.warning("svc: error al cerrar el pool de workers batch: %s", exc)
+    try:
+        fuga_jobs.shutdown_pool()
+        logger.info("svc: pool de workers FUGA cerrado correctamente.")
+    except Exception as exc:
+        logger.warning("svc: error al cerrar el pool de workers FUGA: %s", exc)
 
 
 # ── App ────────────────────────────────────────────────────────────────────────
@@ -382,6 +396,246 @@ async def cancel_batch(
     ok = jobs.cancel_job(job_id)
     if not ok:
         status = jobs.get_status(job_id)
+        if not status:
+            raise HTTPException(status_code=404, detail="Job no encontrado.")
+        raise HTTPException(
+            status_code=409,
+            detail=f"El job no se puede cancelar (estado: {status['estado']}).",
+        )
+    return {"ok": True, "job_id": job_id}
+
+
+# ── FUGA — modelo de cuerpo JSON ──────────────────────────────────────────────
+
+class _FugaJobBody(BaseModel):
+    date_from: str
+    date_to:   str
+
+
+# ── FUGA endpoints ─────────────────────────────────────────────────────────────
+
+@app.post("/fuga", status_code=202)
+async def crear_fuga(
+    body: _FugaJobBody,
+    x_internal_token: str | None = Header(default=None),
+):
+    """Crea un job de búsqueda de catálogo FUGA y lo arranca en background.
+
+    Cuerpo JSON: {date_from: "YYYY-MM-DD", date_to: "YYYY-MM-DD"}
+    Respuesta 202: {job_id}
+
+    Fail-closed en credenciales FUGA: 401 con {error: "no_credentials"} si
+    FUGA_USER / FUGA_PASS no están en el entorno.
+    """
+    _check_token(x_internal_token)
+
+    from svc import fuga as _fuga
+    from svc import fuga_jobs
+
+    # Validar credenciales FUGA antes de crear el job
+    if not _fuga.has_credentials():
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error":   "no_credentials",
+                "message": (
+                    "FUGA_USER y FUGA_PASS no están configurados en el servidor. "
+                    "Define las variables de entorno antes de usar esta función."
+                ),
+            },
+        )
+
+    # Validar formato y rango de fechas
+    try:
+        d_from = date.fromisoformat(body.date_from)
+        d_to   = date.fromisoformat(body.date_to)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail="Formato de fecha inválido. Usa YYYY-MM-DD.",
+        )
+
+    if d_from > d_to:
+        raise HTTPException(
+            status_code=422,
+            detail="date_from no puede ser posterior a date_to.",
+        )
+
+    if (d_to - d_from).days > 366:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "El rango de fechas no puede superar 366 días. "
+                "Divide la búsqueda en rangos más cortos si necesitas cubrir más de un año."
+            ),
+        )
+
+    job_id = fuga_jobs.create_job(body.date_from, body.date_to)
+    fuga_jobs.start_job(job_id)
+
+    logger.info(
+        "svc: FUGA job creado job_id=%s (%s → %s).",
+        job_id, body.date_from, body.date_to,
+    )
+    return {"job_id": job_id}
+
+
+@app.get("/fuga/{job_id}/status")
+async def get_fuga_status(
+    job_id: str,
+    x_internal_token: str | None = Header(default=None),
+):
+    """Estado actual del job FUGA.
+
+    Devuelve: {estado, pages_done, pages_total, status_text,
+               isrcs_found, releases_found, error_msg?}
+
+    estados: running | done | cancelled | error
+    """
+    _validate_job_id(job_id)
+    _check_token(x_internal_token)
+
+    from svc import fuga_jobs
+
+    status = fuga_jobs.get_status(job_id)
+    if not status:
+        raise HTTPException(status_code=404, detail="Job no encontrado.")
+    return status
+
+
+@app.get("/fuga/{job_id}/result.json")
+async def get_fuga_result_json(
+    job_id: str,
+    x_internal_token: str | None = Header(default=None),
+):
+    """Resultado JSON del job FUGA.
+
+    Devuelve: {rows, date_from, date_to, isrcs_total, releases_total}
+    donde rows = [{isrc, product_name, artist_name, label, release_date}]
+
+    Disponible cuando el job está en done, cancelled o error (resultado parcial).
+    """
+    _validate_job_id(job_id)
+    _check_token(x_internal_token)
+
+    from svc import fuga_jobs
+
+    paths = fuga_jobs.get_result_paths(job_id)
+    if paths is None:
+        status = fuga_jobs.get_status(job_id)
+        if not status:
+            raise HTTPException(status_code=404, detail="Job no encontrado.")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Resultado no disponible aún (estado: {status['estado']}).",
+        )
+    if paths["json"] is None:
+        raise HTTPException(status_code=404, detail="Fichero de resultado no encontrado.")
+    return FileResponse(
+        path=str(paths["json"]),
+        media_type="application/json",
+        filename=f"fuga_resultado_{job_id}.json",
+    )
+
+
+@app.get("/fuga/{job_id}/result.csv")
+async def get_fuga_result_csv(
+    job_id: str,
+    x_internal_token: str | None = Header(default=None),
+):
+    """CSV completo del resultado FUGA.
+
+    Columnas: isrc, product_name, artist_name, label, release_date.
+    Disponible cuando el job está en done, cancelled o error.
+    """
+    _validate_job_id(job_id)
+    _check_token(x_internal_token)
+
+    from svc import fuga_jobs
+
+    paths = fuga_jobs.get_result_paths(job_id)
+    if paths is None:
+        status = fuga_jobs.get_status(job_id)
+        if not status:
+            raise HTTPException(status_code=404, detail="Job no encontrado.")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Resultado no disponible aún (estado: {status['estado']}).",
+        )
+    if paths["csv"] is None:
+        raise HTTPException(status_code=404, detail="Fichero CSV no encontrado.")
+    return FileResponse(
+        path=str(paths["csv"]),
+        media_type="text/csv",
+        filename=f"fuga_isrcs_{job_id}.csv",
+    )
+
+
+@app.get("/fuga/{job_id}/result.xlsx")
+async def get_fuga_result_xlsx(
+    job_id: str,
+    xlsx_type: str = Query(default="full", description="'full' (todas las columnas) o 'isrc' (solo ISRC)"),
+    x_internal_token: str | None = Header(default=None),
+):
+    """Excel del resultado FUGA.
+
+    ?xlsx_type=full  → todas las columnas (isrc, product_name, artist_name, label, release_date)
+    ?xlsx_type=isrc  → solo columna ISRC (lista compacta para carga masiva)
+
+    Disponible cuando el job está en done, cancelled o error.
+    """
+    _validate_job_id(job_id)
+    _check_token(x_internal_token)
+
+    if xlsx_type not in ("full", "isrc"):
+        raise HTTPException(
+            status_code=400,
+            detail="Parámetro 'xlsx_type' debe ser 'full' o 'isrc'.",
+        )
+
+    from svc import fuga_jobs
+
+    paths = fuga_jobs.get_result_paths(job_id)
+    if paths is None:
+        status = fuga_jobs.get_status(job_id)
+        if not status:
+            raise HTTPException(status_code=404, detail="Job no encontrado.")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Resultado no disponible aún (estado: {status['estado']}).",
+        )
+
+    xlsx_key = "xlsx_full" if xlsx_type == "full" else "xlsx_isrc"
+    xlsx_path = paths.get(xlsx_key)
+    if xlsx_path is None:
+        raise HTTPException(status_code=404, detail="Fichero Excel no encontrado.")
+
+    suffix = "" if xlsx_type == "full" else "_solo_isrc"
+    return FileResponse(
+        path=str(xlsx_path),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=f"fuga_isrcs{suffix}_{job_id}.xlsx",
+    )
+
+
+@app.post("/fuga/{job_id}/cancel")
+async def cancel_fuga(
+    job_id: str,
+    x_internal_token: str | None = Header(default=None),
+):
+    """Cancela un job FUGA en curso.
+
+    Activa el flag de cancelación: el worker para entre páginas y materializa
+    el resultado parcial acumulado hasta ese momento.
+    """
+    _validate_job_id(job_id)
+    _check_token(x_internal_token)
+
+    from svc import fuga_jobs
+
+    ok = fuga_jobs.cancel_job(job_id)
+    if not ok:
+        status = fuga_jobs.get_status(job_id)
         if not status:
             raise HTTPException(status_code=404, detail="Job no encontrado.")
         raise HTTPException(
