@@ -51,6 +51,12 @@ from cards import _build_card_html
 # CONSTANTES
 # ════════════════════════════════════════════════════════════════════════════
 MAX_BATCH_ISRCS = 500
+# ISRCs máximos por chunk en el bucle de procesado batch (cada chunk = 1 rerun de Streamlit).
+# El chunk también se acota por tiempo (MAX_CHUNK_SECONDS): lo que se cumpla primero.
+BATCH_CHUNK = 10
+# Tiempo máximo de procesado por rerun. Evita que paginación lenta dispare el reinicio
+# del websocket en Streamlit Community Cloud aunque el chunk tenga pocos ISRCs.
+MAX_CHUNK_SECONDS = 25
 SPOTIFY_SCOPES = "playlist-modify-public playlist-modify-private user-read-private user-read-email"
 # SPOTIFY_CENTRAL_MODE = True  # legacy flag, modo central es ahora obligatorio
 
@@ -336,6 +342,8 @@ def lookup_isrc_to_uuid(isrc: str, _buster: str = "") -> dict | None:
     isrc = isrc.strip().upper()
     r = requests.get(f"{SC_BASE}/api/v2/song/by-isrc/{isrc}",
                      headers=_sc_headers(), timeout=15)
+    if r.status_code == 429:
+        raise RuntimeError("Soundcharts 429 rate-limited")
     if r.status_code != 200:
         return None
     obj = (r.json() or {}).get("object") or {}
@@ -361,6 +369,8 @@ def get_song_playlists(uuid: str, platform: str, _buster: str = "") -> list[dict
                     "sortBy": "subscriberCount", "sortOrder": "desc"},
             timeout=20,
         )
+        if r.status_code == 429:
+            raise RuntimeError("Soundcharts 429 rate-limited")
         if r.status_code != 200:
             break
         d = r.json() or {}
@@ -1215,7 +1225,10 @@ def tab_individual():
         st.warning(f"`{isrc}` no parece un ISRC válido.")
         return
 
-    max_per_day = int(st.secrets.get("SOUNDCHARTS_MAX_PER_DAY", "5000"))
+    try:
+        max_per_day = int(st.secrets.get("SOUNDCHARTS_MAX_PER_DAY", "5000"))
+    except (ValueError, TypeError):
+        max_per_day = 5000
     if "calls_today" not in st.session_state:
         st.session_state.calls_today = 0
     if st.session_state.calls_today >= max_per_day:
@@ -1302,11 +1315,164 @@ def tab_individual():
 
 
 def tab_batch():
-    """Tab 2 — procesado batch de Excel con hasta 500 ISRCs."""
+    """Tab 2 — procesado batch de Excel con hasta 500 ISRCs.
+
+    Diseño anti-reinicio (Streamlit Community Cloud):
+    - Los ISRCs y parámetros se persisten en session_state["batch_job"] en cuanto
+      se pulsa "Procesar batch", antes de procesar nada. Así el job sobrevive aunque
+      el file_uploader pierda el fichero en un rerun posterior.
+    - El procesado avanza en chunks acotados por BATCH_CHUNK (nº de ISRCs) Y por
+      MAX_CHUNK_SECONDS (tiempo): lo que se cumpla primero. Cada run es corto.
+    - Al terminar el chunk se llama a st.rerun() para continuar con el siguiente.
+    - El progreso se renderiza UNA sola vez por rerun (sin doble render / parpadeo).
+    - Un botón "Cancelar" para el bucle de reruns conservando lo procesado.
+    """
     st.markdown(
         "Sube un Excel/CSV con una columna **`ISRC`**. La app busca cada uno en "
         "Soundcharts y te muestra una tabla unificada con todas las playlists."
     )
+
+    job = st.session_state.get("batch_job")
+
+    # Limpiar job zombie: cancelled=True pero done=False → marcarlo done para no
+    # volver a entrar en FASE A en el siguiente rerun (punto 8).
+    if job and job.get("cancelled") and not job.get("done"):
+        job["done"] = True
+
+    # ── FASE A: job en curso (chunks pendientes) ─────────────────────────────
+    if job and not job.get("done"):
+        isrcs_job = job["isrcs"]
+        idx = job["idx"]
+        total = len(isrcs_job)
+
+        # Barra de progreso: UNA sola render al inicio del run, leída de session_state.
+        # No se actualiza tras procesar el chunk para evitar parpadeo (punto 2).
+        st.markdown("**Procesando batch…**")
+        st.progress(idx / max(total, 1),
+                    text=f"{idx} / {total} ISRCs procesados")
+
+        if st.button("⏹ Cancelar", key="batch_cancel"):
+            job["cancelled"] = True
+            st.rerun()
+
+        try:
+            max_per_day = int(st.secrets.get("SOUNDCHARTS_MAX_PER_DAY", "5000"))
+        except (ValueError, TypeError):
+            max_per_day = 5000
+
+        # Procesar el siguiente chunk acotado por nº Y por tiempo (punto 1).
+        # idx avanza por el nº REAL de ISRCs procesados en este run.
+        t0 = time.time()
+        procesados_en_run = 0
+        with st.spinner("Buscando en Soundcharts…"):
+            while idx + procesados_en_run < total:
+                if procesados_en_run >= BATCH_CHUNK:
+                    break
+                if time.time() - t0 > MAX_CHUNK_SECONDS:
+                    break
+                # Comprobar límite diario ANTES de incrementar procesados_en_run
+                # para no sobre-contar el ISRC que dispara el corte (punto 2).
+                if st.session_state.get("calls_today", 0) >= max_per_day:
+                    job["cancelled"] = True
+                    break
+                isrc = isrcs_job[idx + procesados_en_run]
+                procesados_en_run += 1
+                try:
+                    res = search_isrc(isrc, job["platforms"], buster=job["buster"])
+                except Exception as e:
+                    job["not_found"].append((isrc, f"error: {str(e)[:80]}"))
+                    continue
+                calls = res.get("calls_used", 0)
+                job["calls_used"] += calls
+                st.session_state["calls_today"] = (
+                    st.session_state.get("calls_today", 0) + calls
+                )
+                if not res.get("meta"):
+                    job["not_found"].append((isrc, "no en Soundcharts"))
+                    continue
+                job["meta"][isrc] = res["meta"]
+                for p in res.get("playlists", []):
+                    p2 = dict(p)
+                    p2["isrc"] = isrc
+                    p2["song_name"] = res["meta"].get("song_name") or ""
+                    p2["credit_name"] = res["meta"].get("credit_name") or ""
+                    job["playlists"].append(p2)
+
+        # Guarda anti bucle-infinito: si el cap de tiempo se disparó antes de
+        # procesar ni un ISRC y aún quedan ISRCs, forzar avance de 1 para que
+        # el st.rerun() siguiente no vuelva al mismo idx (punto 1 HIGH).
+        if procesados_en_run == 0 and idx < total:
+            job["not_found"].append((isrcs_job[idx], "timeout antes de procesar"))
+            procesados_en_run = 1
+
+        job["idx"] = idx + procesados_en_run
+        new_idx = job["idx"]
+
+        # Aviso informativo si se acumulan muchos placements (posible lentitud)
+        if len(job["playlists"]) > 10000:
+            st.warning(
+                f"Se han acumulado {len(job['playlists']):,} placements. "
+                "Si la app se vuelve lenta, considera procesar lotes más pequeños."
+            )
+
+        if new_idx >= total or job.get("cancelled"):
+            # Job terminado (completo o cancelado).
+            # Al cancelar: registrar los ISRCs no procesados como "no procesado"
+            # para que el resultado sea honesto sobre la cobertura (punto 4).
+            if job.get("cancelled") and new_idx < total:
+                for isrc_pend in isrcs_job[new_idx:]:
+                    job["not_found"].append((isrc_pend, "no procesado (cancelado)"))
+            job["done"] = True
+            st.session_state["batch_result"] = {
+                "meta": job["meta"],
+                "playlists": job["playlists"],
+                "not_found": job["not_found"],
+                "calls_used": job["calls_used"],
+            }
+            st.session_state["batch_isrcs"] = isrcs_job
+            # Guardar mensaje en session_state: st.success/warning aquí se descartaría
+            # con el st.rerun() siguiente, así que se muestra en FASE B (punto 6).
+            if job.get("cancelled"):
+                st.session_state["batch_job_msg"] = {
+                    "level": "warning",
+                    "text": (
+                        "Procesado interrumpido. "
+                        f"Se encontraron {len(job['meta'])} canciones "
+                        f"de las {total} del Excel. "
+                        "Puedes descargar los resultados parciales abajo."
+                    ),
+                }
+            else:
+                st.session_state["batch_job_msg"] = {
+                    "level": "success",
+                    "text": (
+                        f"✅ Listo: {len(job['meta'])} canciones encontradas, "
+                        f"{len(job['playlists'])} placements en total."
+                    ),
+                }
+            st.rerun()
+        else:
+            # Aún quedan chunks: continuar en el siguiente rerun
+            st.rerun()
+        return
+
+    # ── FASE B: formulario de carga (job no activo o ya terminado) ───────────
+
+    # Mostrar mensaje de fin/cancelación guardado en session_state (punto 6).
+    # Se usa pop() para mostrarlo solo una vez.
+    job_msg = st.session_state.pop("batch_job_msg", None)
+    if job_msg:
+        if job_msg["level"] == "success":
+            st.success(job_msg["text"])
+        else:
+            st.warning(job_msg["text"])
+
+    # Job activo: determinar si hay uno corriendo para deshabilitar el botón (punto 11)
+    _job_running = bool(
+        st.session_state.get("batch_job")
+        and not st.session_state["batch_job"].get("done")
+    )
+
     col_up, col_plat = st.columns([3, 1])
     with col_up:
         uploaded = st.file_uploader("Excel con ISRCs", type=["xlsx", "xls", "csv"],
@@ -1316,7 +1482,13 @@ def tab_batch():
                               key="batch_scope", label_visibility="collapsed")
 
     if not uploaded:
-        st.info(f"Sin Excel subido. Máximo {MAX_BATCH_ISRCS} ISRCs por batch.")
+        # Punto 9: mensaje distinto si ya hay resultado previo
+        if st.session_state.get("batch_result"):
+            st.info("Último batch procesado. Sube un nuevo Excel para procesar otro lote.")
+            st.divider()
+            show_batch_result()
+        else:
+            st.info(f"Sin Excel subido. Máximo {MAX_BATCH_ISRCS} ISRCs por batch.")
         return
 
     try:
@@ -1337,12 +1509,15 @@ def tab_batch():
 
     platforms = _platforms_for_scope(scope)
     est_calls = len(isrcs) * (len(platforms) + 1)
-    max_per_day = int(st.secrets.get("SOUNDCHARTS_MAX_PER_DAY", "5000"))
+    try:
+        max_per_day = int(st.secrets.get("SOUNDCHARTS_MAX_PER_DAY", "5000"))
+    except (ValueError, TypeError):
+        max_per_day = 5000
     consumed = st.session_state.get("calls_today", 0)
 
     c1, c2, c3 = st.columns(3)
     c1.metric("ISRCs detectados", f"{len(isrcs)}")
-    c2.metric("Llamadas API estimadas", f"~{est_calls:,}",
+    c2.metric("Búsquedas estimadas", f"~{est_calls:,}",
               help="Aproximación. La cifra real puede bajar si los ISRCs ya estaban en cache.")
     c3.metric("Consumido hoy", f"{consumed} / {max_per_day}")
 
@@ -1352,18 +1527,24 @@ def tab_batch():
             f"({consumed} + {est_calls} > {max_per_day}). Se cortará a mitad."
         )
 
-    if st.button("🚀 Procesar batch", type="primary"):
-        buster = st.session_state.get("cache_buster", "")
-        prog = st.progress(0.0, text="Empezando…")
-        def _cb(i, total, isrc):
-            prog.progress(i / max(total, 1), text=f"{i}/{total} — {isrc}")
-        res = batch_search(isrcs, platforms, buster=buster, progress_cb=_cb)
-        prog.empty()
-        st.session_state.calls_today = consumed + res["calls_used"]
-        st.session_state.batch_result = res
-        st.session_state.batch_isrcs = isrcs
-        st.success(f"✅ Procesado: {len(res['meta'])} ISRCs resueltos, "
-                   f"{len(res['playlists'])} placements, {res['calls_used']} llamadas API.")
+    # Botón deshabilitado si hay un job activo en otro tab / rerun (punto 11)
+    if st.button("🚀 Procesar batch", type="primary", disabled=_job_running):
+        # Persistir el job ANTES de procesar nada: así sobrevive a reruns aunque
+        # el file_uploader pierda el fichero (causa raíz del reinicio en Cloud).
+        st.session_state["batch_job"] = {
+            "isrcs": isrcs,
+            "platforms": platforms,
+            "scope": scope,
+            "buster": st.session_state.get("cache_buster", ""),
+            "idx": 0,
+            "meta": {},
+            "playlists": [],
+            "not_found": [],
+            "calls_used": 0,
+            "done": False,
+            "cancelled": False,
+        }
+        st.rerun()
 
     # Si hay un resultado guardado (de este procesado o de uno previo), mostrarlo
     if st.session_state.get("batch_result"):
