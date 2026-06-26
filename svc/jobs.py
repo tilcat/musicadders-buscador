@@ -282,7 +282,7 @@ def _run_job(job_id: str) -> None:
     5. Entre ISRCs: comprueba el flag de cancelación.
     6. Al terminar: materializa .json/.csv/.xlsx, marca done/cancelled/error.
     """
-    from svc.soundcharts import search_isrc, _is_official_type
+    from svc.soundcharts import search_isrc
 
     # Leer params
     with _get_conn() as conn:

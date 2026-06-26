@@ -9,9 +9,9 @@ de st.cache_data / st.secrets.
 Cache en proceso: dict con TTL de 3600 s (igual que el @st.cache_data original).
 Credenciales: variables de entorno SOUNDCHARTS_APP_ID y SOUNDCHARTS_API_KEY.
 
-Política 429: si Soundcharts devuelve 429, lanza RuntimeError("Soundcharts 429
-rate-limited") — NO se trata como not-found; el caller (jobs.py) lo registra
-como error y para el job si procede.
+Política 429: si Soundcharts devuelve 429, lanza SoundchartsRateLimitError
+(subclase de RuntimeError) — NO se trata como not-found; el caller (jobs.py)
+lo registra como error y para el job si procede. main.py lo captura por tipo.
 """
 
 from __future__ import annotations
@@ -27,6 +27,15 @@ from typing import Any
 import requests
 
 logger = logging.getLogger(__name__)
+
+
+class SoundchartsRateLimitError(RuntimeError):
+    """Soundcharts devolvió HTTP 429 (rate limit).
+
+    Extiende RuntimeError para mantener compatibilidad con código existente
+    que captura `except RuntimeError` (svc/jobs.py).
+    """
+
 
 # ── Configuración ─────────────────────────────────────────────────────────────
 
@@ -178,7 +187,7 @@ def lookup_isrc_to_uuid(isrc: str, buster: str = "") -> dict | None:
         timeout=15,
     )
     if r.status_code == 429:
-        raise RuntimeError("Soundcharts 429 rate-limited")
+        raise SoundchartsRateLimitError("Soundcharts 429 rate-limited")
     if r.status_code != 200:
         _cache_set(cache_key, None)
         return None
@@ -198,7 +207,7 @@ def get_song_playlists(uuid: str, platform: str, buster: str = "") -> list[dict]
     """Playlists actuales de un song en una plataforma. Pagina hasta el total.
 
     Cacheado en proceso con TTL de 3600 s.
-    Lanza RuntimeError si Soundcharts devuelve 429.
+    Lanza SoundchartsRateLimitError si Soundcharts devuelve 429.
     Devuelve lista vacía si no hay playlists o el endpoint falla.
     """
     cache_key = f"pls:{uuid}:{platform}:{buster}"
@@ -222,7 +231,7 @@ def get_song_playlists(uuid: str, platform: str, buster: str = "") -> list[dict]
             timeout=20,
         )
         if r.status_code == 429:
-            raise RuntimeError("Soundcharts 429 rate-limited")
+            raise SoundchartsRateLimitError("Soundcharts 429 rate-limited")
         if r.status_code != 200:
             break
         d = r.json() or {}
@@ -262,7 +271,7 @@ def search_isrc(isrc: str, platforms: list[str], buster: str = "") -> dict:
         "calls_used": int,        # estimación de llamadas API consumidas
       }
 
-    Lanza RuntimeError("Soundcharts 429 rate-limited") si la API responde 429.
+    Lanza SoundchartsRateLimitError si la API responde 429.
     Si el ISRC no existe, devuelve meta=None y playlists=[].
     """
     meta = lookup_isrc_to_uuid(isrc, buster=buster)

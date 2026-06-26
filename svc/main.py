@@ -31,15 +31,52 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
+import time
 from contextlib import asynccontextmanager
+from datetime import date
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
 # Patrón de job_id válido: UUID4 canónico (8-4-4-4-12 hex, separados por guiones)
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+# Patrón ISRC: 2 letras de país + 3 alfanuméricos + 7 dígitos (RFC 3901)
+_ISRC_RE = re.compile(r"^[A-Za-z]{2}[A-Za-z0-9]{3}\d{7}$")
+
+
+# ── Contador diario de llamadas Soundcharts (paridad con app.py Streamlit) ────
+#
+# Contador en proceso, thread-safe.  Reseteado automáticamente al cambiar el
+# día (comparando la fecha ISO).  Expuesto en /health; usado en /search para
+# devolver 429 propio si se supera SOUNDCHARTS_MAX_PER_DAY.
+
+_daily_lock = threading.Lock()
+_daily_state: dict[str, object] = {"date": None, "calls": 0}
+
+
+def _today_iso() -> str:
+    return date.today().isoformat()
+
+
+def _accum_calls(n: int) -> int:
+    """Acumula n llamadas al contador diario. Resetea si cambia el día. Devuelve el total."""
+    today = _today_iso()
+    with _daily_lock:
+        if _daily_state["date"] != today:
+            _daily_state["date"] = today
+            _daily_state["calls"] = 0
+        _daily_state["calls"] = int(_daily_state["calls"]) + n  # type: ignore[arg-type]
+        return int(_daily_state["calls"])
+
+
+def _daily_snapshot() -> tuple[int, str]:
+    """Devuelve (total_hoy, fecha_iso) sin modificar el contador."""
+    with _daily_lock:
+        return int(_daily_state["calls"]), str(_daily_state["date"] or _today_iso())
 
 
 def _validate_job_id(job_id: str) -> None:
@@ -142,8 +179,17 @@ def _check_token(x_internal_token: str | None) -> None:
 
 @app.get("/health")
 async def health():
-    """Liveness probe — sin autenticación."""
-    return {"status": "ok", "service": "svc-buscador", "version": "0.1.0"}
+    """Liveness probe — sin autenticación. Incluye contador de llamadas Soundcharts del día."""
+    calls_today, calls_date = _daily_snapshot()
+    max_per_day = int(os.environ.get("SOUNDCHARTS_MAX_PER_DAY", "5000"))
+    return {
+        "status": "ok",
+        "service": "svc-buscador",
+        "version": "0.1.0",
+        "calls_today": calls_today,
+        "calls_date": calls_date,
+        "calls_limit": max_per_day,
+    }
 
 
 @app.post("/batch", status_code=202)
@@ -343,3 +389,119 @@ async def cancel_batch(
             detail=f"El job no se puede cancelar (estado: {status['estado']}).",
         )
     return {"ok": True, "job_id": job_id}
+
+
+@app.get("/search")
+def search_single(
+    isrc: str = Query(..., description="Código ISRC del track (12 chars)"),
+    scope: str = Query(
+        default="importantes",
+        description="'importantes', 'todas' o nombre de plataforma individual",
+    ),
+    bust: str = Query(
+        default="",
+        description="Cache-buster opcional; si cambia fuerza re-fetch a Soundcharts",
+    ),
+    x_internal_token: str | None = Header(default=None),
+):
+    """Búsqueda síncrona de un único ISRC en Soundcharts.
+
+    Declarado como `def` (no async) para que FastAPI lo ejecute en su threadpool
+    y la llamada bloqueante a Soundcharts (requests) no congele el event loop.
+
+    Contrato de respuesta (200 OK):
+      {
+        meta: {uuid, song_name, credit_name, release_date} | null,
+        playlists: [{platform, playlist_name, playlist_type,
+                     subscriber_count, position, ...}],
+        calls_used: int,
+        elapsed_ms: int,
+        platforms_count: int,   // DSPs con ≥1 resultado
+        total_platforms: int,   // DSPs consultadas según el scope
+      }
+
+    meta=null si el ISRC no existe en Soundcharts (sigue siendo 200, no 404).
+    429 de Soundcharts  → 429 con {error: "rate_limited", message: str}.
+    429 de cuota diaria → 429 con {error: "rate_limit_daily", message: str}.
+    503 si credenciales Soundcharts no configuradas.
+    """
+    _check_token(x_internal_token)
+
+    # Guardia de cuota diaria (paridad con Streamlit app.py)
+    max_per_day = int(os.environ.get("SOUNDCHARTS_MAX_PER_DAY", "5000"))
+    cur_calls, _ = _daily_snapshot()
+    if cur_calls >= max_per_day:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": "rate_limit_daily",
+                "message": (
+                    f"Límite diario de {max_per_day} llamadas a Soundcharts alcanzado. "
+                    "El contador se resetea a medianoche."
+                ),
+            },
+        )
+
+    # Normalizar y validar el ISRC
+    isrc_norm = isrc.strip().upper()
+    if not _ISRC_RE.match(isrc_norm):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"ISRC '{isrc}' inválido. Formato esperado: "
+                "2 letras de país + 3 alfanuméricos + 7 dígitos (ej. ES14H2600001)."
+            ),
+        )
+
+    platforms = _platforms_for_scope(scope)
+
+    from svc import soundcharts as _sc
+    from svc.soundcharts import SoundchartsRateLimitError
+
+    t0 = time.time()
+    try:
+        result = _sc.search_isrc(isrc_norm, platforms, buster=bust)
+    except SoundchartsRateLimitError:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": "rate_limited",
+                "message": (
+                    "Soundcharts ha devuelto 429 (rate limit). "
+                    "Espera unos segundos y reintenta."
+                ),
+            },
+        )
+    except EnvironmentError as exc:
+        # _sc_headers() lanza EnvironmentError si faltan SOUNDCHARTS_APP_ID/API_KEY
+        raise HTTPException(
+            status_code=503,
+            detail=f"Credenciales Soundcharts no configuradas: {exc}",
+        )
+    except RuntimeError as exc:
+        # RuntimeError genérico inesperado del cliente → 502
+        raise HTTPException(
+            status_code=502,
+            detail=f"Error al consultar Soundcharts: {exc}",
+        )
+
+    elapsed_ms = int((time.time() - t0) * 1000)
+    playlists = result.get("playlists") or []
+    platforms_count = len({p["platform"] for p in playlists})
+
+    # Acumular en el contador diario DESPUÉS de la llamada exitosa
+    _accum_calls(result.get("calls_used", 0))
+
+    logger.info(
+        "svc: /search isrc=%s scope=%s platforms=%d results=%d elapsed_ms=%d",
+        isrc_norm, scope, len(platforms), len(playlists), elapsed_ms,
+    )
+
+    return JSONResponse(content={
+        "meta": result.get("meta"),
+        "playlists": playlists,
+        "calls_used": result.get("calls_used", 0),
+        "elapsed_ms": elapsed_ms,
+        "platforms_count": platforms_count,
+        "total_platforms": len(platforms),
+    })

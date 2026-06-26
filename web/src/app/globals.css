@@ -55,7 +55,8 @@
   --color-danger:         #dc2626;
   --color-danger-bg:      #fef2f2;
   --color-danger-border:  #fca5a5;
-  --color-danger-text:    #dc2626;
+  /* Fix 11: #dc2626 falla WCAG AA sobre fondo danger (#fef2f2); #991b1b lo supera */
+  --color-danger-text:    #991b1b;
 
   /* Plataformas DSP */
   --color-spotify:        #1a9e5c;
@@ -86,6 +87,12 @@
   --transition-fast:   150ms ease;
   --transition-base:   200ms ease;
   --transition-slow:   300ms ease;
+
+  /* Fix 14: tokens del chip "algorithmic" — únicos valores fuera del sistema,
+   * movidos a variables para coherencia con el resto de tokens semánticos. */
+  --color-algorithmic-bg:     #eef2ff;
+  --color-algorithmic-text:   #4f46e5;
+  --color-algorithmic-border: #c7d2fe;
 }
 
 /* ─── Globals base ──────────────────────────────────────────────────────────── */
@@ -389,9 +396,9 @@ body {
 }
 
 .type-chip[data-type="algorithmic"] {
-  background: #eef2ff;
-  color: #4f46e5;
-  border-color: #c7d2fe;
+  background: var(--color-algorithmic-bg);
+  color: var(--color-algorithmic-text);
+  border-color: var(--color-algorithmic-border);
 }
 
 .type-chip[data-type="charts"] {
@@ -404,4 +411,132 @@ body {
   background: var(--color-surface-raised);
   color: var(--color-text-soft);
   border-color: var(--color-border);
+}
+
+/* ─── F2 "Buscar 1 ISRC" — componentes propios ──────────────────────────────── */
+
+/*
+ * Badge de ISRC en TrackHeader: tipografía mono, borde sutil, fondo raised.
+ * Intencionalmente más discreta que un chip de plataforma.
+ */
+.isrc-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  border: 1px solid var(--color-border-strong);
+  background: var(--color-surface-raised);
+  color: var(--color-text-soft);
+  user-select: all;
+}
+
+/*
+ * Chip de filtro de tipo (toggle).
+ * Estado neutro cuando filter vacío (sin filtro activo).
+ * data-active="true" cuando ese tipo está incluido en el filtro.
+ * Chips excluidos reciben opacity:0.45 vía prop style (inline).
+ */
+.filter-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border-radius: 9999px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  color: var(--color-text-soft);
+  transition:
+    background var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast);
+  white-space: nowrap;
+  user-select: none;
+  font-family: var(--font-sans);
+}
+
+.filter-chip:hover {
+  border-color: var(--color-border-strong);
+  color: var(--color-text);
+}
+
+.filter-chip[data-active="true"] {
+  background: var(--color-accent-bg);
+  border-color: var(--color-success-border);
+  color: var(--color-accent-hover);
+}
+
+/*
+ * Encabezado de sección de plataforma en la lista de playlists F2.
+ * Borde inferior que actúa como separador semántico entre DSPs.
+ */
+.pl-section-header {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding-bottom: 6px;
+  margin-bottom: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-text-soft);
+}
+
+/*
+ * Tarjeta de playlist individual: fila compacta horizontal.
+ * Componentes: [dot] [nombre] [TypeChip] [seguidores mono] [#pos]
+ */
+.pl-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  transition:
+    border-color var(--transition-fast),
+    background var(--transition-fast);
+}
+
+/* Fix 12: .pl-card:hover eliminado — Soundcharts no expone URL navegable de playlist,
+ * así que el efecto hover creaba falsa affordance de interactividad. Si en el futuro
+ * se añade la URL, convertir el card en <a> y restaurar el hover con cursor:pointer. */
+
+/* Nombre de playlist: ocupa el espacio sobrante, truncado. */
+.pl-card-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text);
+}
+
+/* Número de seguidores: mono, compacto. */
+.pl-card-subs {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-text-soft);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* Posición en la playlist: mono, muted, alineado a la derecha. */
+.pl-card-pos {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-text-muted);
+  white-space: nowrap;
+  flex-shrink: 0;
+  min-width: 28px;
+  text-align: right;
 }

@@ -17,6 +17,16 @@ function IconTable(props) {
   );
 }
 
+function IconSearch(props) {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
+      <circle cx="11" cy="11" r="8" />
+      <path d="m21 21-4.35-4.35" />
+    </svg>
+  );
+}
+
 function IconLogOut(props) {
   return (
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -40,6 +50,13 @@ function IconChevronRight(props) {
 // ── Nav items ─────────────────────────────────────────────────────────────────
 
 const NAV_ITEMS = [
+  {
+    key: "buscar",
+    segment: "buscar",
+    label: "Buscar 1 ISRC",
+    description: "Un ISRC → playlists en DSPs",
+    Icon: IconSearch,
+  },
   {
     key: "batch",
     segment: "batch",
