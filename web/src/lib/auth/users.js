@@ -2,8 +2,7 @@
  * Carga los usuarios desde web/users.json (gitignored).
  * Formato: { "email@example.com": "$2b$12$hashbcrypt..." }
  *
- * Si el archivo no existe, solo el usuario de fallback de desarrollo
- * (definido en .env.local con DEV_USER_EMAIL/DEV_USER_HASH) estará disponible.
+ * Si el archivo no existe, devuelve {} y ninguna credencial es válida.
  */
 
 import { readFileSync } from "node:fs";
@@ -12,21 +11,39 @@ import bcrypt from "bcryptjs";
 
 let _users = null;
 
+/**
+ * Carga users.json con catch discriminado:
+ *   - ENOENT → {} (fichero no existe, normal en instalación nueva)
+ *   - Otros errores (EACCES, JSON inválido/corrupto) → LANZA
+ *     para que el llamador reciba el error con causa identificable
+ *     en lugar de silenciar la corrupción y denegar acceso a todos.
+ */
 function loadUsers() {
   if (_users) return _users;
 
-  _users = {};
-
-  // Cargar desde users.json si existe
+  let raw;
   try {
-    const usersPath = resolve(process.cwd(), "users.json");
-    const raw = readFileSync(usersPath, "utf8");
-    _users = JSON.parse(raw);
-  } catch {
-    // No existe users.json — normal en dev mínimo
+    raw = readFileSync(resolve(process.cwd(), "users.json"), "utf8");
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      _users = {};
+      return _users;
+    }
+    throw err; // EACCES, EROFS, etc. — propagar
   }
 
+  // JSON.parse lanza SyntaxError si el fichero está corrupto — propagar.
+  _users = JSON.parse(raw);
   return _users;
+}
+
+/**
+ * Invalida la caché en memoria de users.json.
+ * Llamar tras cada escritura exitosa (POST/DELETE de /api/admin/users)
+ * para que el siguiente login lea el estado actualizado desde disco.
+ */
+export function invalidateUsersCache() {
+  _users = null;
 }
 
 /**
@@ -38,9 +55,16 @@ function loadUsers() {
 export async function verifyCredentials(email, password) {
   if (!email || !password) return false;
 
-  const users = loadUsers();
-  const hash = users[email.toLowerCase().trim()];
+  let users;
+  try {
+    users = loadUsers();
+  } catch {
+    // Si users.json no se puede leer (corrupto, sin permisos),
+    // denegar acceso en lugar de silenciar el error.
+    return false;
+  }
 
+  const hash = users[email.toLowerCase().trim()];
   if (!hash) return false;
 
   return bcrypt.compare(password, hash);

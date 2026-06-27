@@ -70,6 +70,15 @@ function IconChevronRight(props) {
   );
 }
 
+function IconShield(props) {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
+      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+    </svg>
+  );
+}
+
 // ── Nav items ─────────────────────────────────────────────────────────────────
 
 const NAV_ITEMS = [
@@ -137,9 +146,19 @@ function NavItem({ href, label, description, Icon, isActive }) {
   );
 }
 
+// ── Nav item de admin (solo visible para admins) ──────────────────────────────
+
+const ADMIN_NAV_ITEM = {
+  key:         "admin",
+  segment:     "admin",
+  label:       "Administración",
+  description: "Gestionar usuarios con acceso",
+  Icon:        IconShield,
+};
+
 // ── Sidebar ───────────────────────────────────────────────────────────────────
 
-export default function Sidebar() {
+export default function Sidebar({ isAdmin = false }) {
   const pathname = usePathname();
   const router = useRouter();
 
@@ -246,6 +265,44 @@ export default function Sidebar() {
             />
           );
         })}
+
+        {/* Admin — solo visible para administradores (SPOTIFY_CENTRAL_ADMINS) */}
+        {isAdmin && (
+          <>
+            <div
+              style={{
+                height: 1,
+                background: "var(--color-border)",
+                margin: "8px 4px",
+              }}
+            />
+            <p
+              style={{
+                padding: "0 12px",
+                marginBottom: 4,
+                marginTop: 2,
+                fontSize: 10,
+                fontWeight: 600,
+                textTransform: "uppercase",
+                letterSpacing: "0.08em",
+                color: "var(--color-text-muted)",
+              }}
+            >
+              Sistema
+            </p>
+            <NavItem
+              key={ADMIN_NAV_ITEM.key}
+              href={`/${ADMIN_NAV_ITEM.segment}`}
+              label={ADMIN_NAV_ITEM.label}
+              description={ADMIN_NAV_ITEM.description}
+              Icon={ADMIN_NAV_ITEM.Icon}
+              isActive={
+                pathname === `/${ADMIN_NAV_ITEM.segment}` ||
+                pathname.startsWith(`/${ADMIN_NAV_ITEM.segment}/`)
+              }
+            />
+          </>
+        )}
       </nav>
 
       {/* Footer: logout */}

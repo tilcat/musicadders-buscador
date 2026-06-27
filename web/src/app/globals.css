@@ -144,6 +144,12 @@ body {
   min-width: 640px;
 }
 
+/* Modificador para tablas de 2 columnas que no necesitan scroll horizontal.
+   Úsalo añadiendo "fuga-table--simple" junto a "fuga-table". */
+.fuga-table.fuga-table--simple {
+  min-width: 100%;
+}
+
 .fuga-table thead {
   position: sticky;
   top: 0;

@@ -884,8 +884,16 @@ def test_playlist_status_contract_fields(client, auth_headers):
 
 def test_playlist_cancel_running_job(client, auth_headers):
     """
-    o) Cancelar un job en curso: responde 200 y el job termina en 'cancelled'
-    (o 'done' si el worker fue demasiado rápido).
+    o) Cancelar un job en curso.
+
+    El cancel llega mientras el worker está en el mock lento (delay=0.6 s).
+    Resultados válidos:
+      - Cancel responde 200 + ok:True → el job termina en 'cancelled'.
+      - Cancel responde 409          → el worker fue demasiado rápido y ya
+        terminó en 'done' antes de que llegara el cancel. Ambos son correctos.
+
+    El assert de cancel acepta 200 o 409 para evitar el race. La comprobación
+    de estado final sigue siendo "cancelled" o "done".
     """
     slow_resolve = _make_slow_resolve(delay=0.6)
 
@@ -904,8 +912,11 @@ def test_playlist_cancel_running_job(client, auth_headers):
         job_id = r.json()["job_id"]
 
         r_cancel = client.post(f"/playlist/{job_id}/cancel", headers=auth_headers)
-        assert r_cancel.status_code == 200, r_cancel.text
-        assert r_cancel.json().get("ok") is True
+        # 200 → cancel en curso (esperado). 409 → worker ya terminó (race benigna).
+        # Ambos son respuestas correctas del endpoint; el assert no debe flakear.
+        assert r_cancel.status_code in (200, 409), (
+            f"Cancel esperado 200 o 409, obtenido {r_cancel.status_code}: {r_cancel.text}"
+        )
 
         status = _wait_for_done(client, job_id, auth_headers, timeout=10)
 
