@@ -646,3 +646,34 @@ body {
   top: 0;
   height: 100%;
 }
+
+/* ─── F4 "Crear playlist Spotify" — componentes propios ─────────────────────── */
+
+/*
+ * Botón-enlace para abrir la playlist recién creada en Spotify.
+ * Pill verde (distinto del rect del .btn) para dar peso visual al CTA principal.
+ * Usa --color-accent (el verde del sistema, = --color-spotify) para no romper
+ * coherencia — el toque "Spotify" es la forma + el icono de música, no un color ajeno.
+ * Accesibilidad: se alinea con .btn-primary (blanco sobre accent), mismo contraste.
+ */
+.spotify-playlist-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 20px;
+  border-radius: 9999px;
+  background: var(--color-accent);
+  color: #ffffff;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
+  transition: background var(--transition-fast);
+  align-self: flex-start;
+  border: none;
+  cursor: pointer;
+}
+
+.spotify-playlist-link:hover {
+  background: var(--color-accent-hover);
+}

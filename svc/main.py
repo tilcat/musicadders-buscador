@@ -34,13 +34,14 @@ import re
 import threading
 import time
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from typing import Annotated
 
 # Patrón de job_id válido: UUID4 canónico (8-4-4-4-12 hex, separados por guiones)
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -129,10 +130,19 @@ async def _lifespan(app: FastAPI):
             logger.info("svc: cleanup eliminó %d jobs FUGA antiguos al arrancar.", n)
     except Exception as exc:
         logger.warning("svc: error en cleanup de jobs FUGA al arrancar: %s", exc)
+    # Startup: limpiar jobs Spotify antiguos (retención 7 días)
+    from svc import spotify_jobs as _sp_jobs_startup
+    try:
+        n = _sp_jobs_startup.cleanup_old_jobs(max_age_days=7)
+        if n:
+            logger.info("svc: cleanup eliminó %d jobs Spotify antiguos al arrancar.", n)
+    except Exception as exc:
+        logger.warning("svc: error en cleanup de jobs Spotify al arrancar: %s", exc)
     yield
     # Shutdown: cancel_futures=True, wait=False (no espera llamadas HTTP largas)
     from svc import jobs
     from svc import fuga_jobs
+    from svc import spotify_jobs
     try:
         jobs.shutdown_pool()
         logger.info("svc: pool de workers batch cerrado correctamente.")
@@ -143,6 +153,11 @@ async def _lifespan(app: FastAPI):
         logger.info("svc: pool de workers FUGA cerrado correctamente.")
     except Exception as exc:
         logger.warning("svc: error al cerrar el pool de workers FUGA: %s", exc)
+    try:
+        spotify_jobs.shutdown_pool()
+        logger.info("svc: pool de workers Spotify cerrado correctamente.")
+    except Exception as exc:
+        logger.warning("svc: error al cerrar el pool de workers Spotify: %s", exc)
 
 
 # ── App ────────────────────────────────────────────────────────────────────────
@@ -759,3 +774,400 @@ def search_single(
         "platforms_count": platforms_count,
         "total_platforms": len(platforms),
     })
+
+
+# ── Spotify — modelos de cuerpo JSON ──────────────────────────────────────────
+
+_SP_MAX_QUEUED = 5  # máximo de jobs en cola simultáneos (pending + running)
+
+
+class _PlaylistJobBody(BaseModel):
+    isrcs:       Annotated[list[str], Field(max_length=10_000)]
+    name:        Annotated[str,       Field(max_length=200)]
+    description: Annotated[str,       Field("", max_length=300)] = ""
+    public:      bool = False
+
+
+class _SetupExchangeBody(BaseModel):
+    code:         str
+    state:        str
+    redirect_uri: str
+
+
+# ── Helpers de admin para endpoints de setup ──────────────────────────────────
+
+def _check_admin(x_user_email: str | None) -> None:
+    """Valida que el email sea admin de Spotify (defensa en profundidad).
+
+    - SPOTIFY_CENTRAL_ADMINS no configurado → 403 fail-closed.
+    - Email ausente o no en la lista → 403.
+    """
+    admins_raw = os.environ.get("SPOTIFY_CENTRAL_ADMINS", "").strip()
+    if not admins_raw:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "SPOTIFY_CENTRAL_ADMINS no configurado en el servidor. "
+                "El setup de la cuenta Spotify está deshabilitado."
+            ),
+        )
+    admins = {a.strip().lower() for a in admins_raw.split(",") if a.strip()}
+    email  = (x_user_email or "").strip().lower()
+    if not email or email not in admins:
+        raise HTTPException(
+            status_code=403,
+            detail="Acceso restringido a administradores.",
+        )
+
+
+# ── Spotify setup endpoints ────────────────────────────────────────────────────
+# IMPORTANTE: registrar ANTES de los endpoints /{job_id}/* para evitar ambigüedad
+# entre /playlist/setup/... y /playlist/{job_id}/...
+
+@app.get("/playlist/setup/status")
+async def get_playlist_setup_status(
+    x_internal_token: str | None = Header(default=None),
+    x_user_email:     str | None = Header(default=None),
+):
+    """Estado de la cuenta Spotify central.
+
+    Solo accesible por admins (doble capa: Next proxy + svc).
+    Devuelve: {connected, account_name, expires_at}
+    """
+    _check_token(x_internal_token)
+    _check_admin(x_user_email)
+
+    from svc import spotify as _sp
+    return _sp.get_setup_status()
+
+
+@app.get("/playlist/setup/connect")
+async def get_playlist_setup_connect(
+    x_internal_token: str | None = Header(default=None),
+    x_user_email:     str | None = Header(default=None),
+):
+    """Genera la URL de autorización OAuth de Spotify para el admin.
+
+    El estado HMAC incluye el email del admin para verificación en /exchange.
+    Devuelve: {login_url}
+
+    GATE de despliegue: la redirect_uri (APP_BASE_URL + /api/playlist/setup/callback)
+    DEBE estar registrada en developer.spotify.com antes de usar este endpoint.
+    """
+    _check_token(x_internal_token)
+    _check_admin(x_user_email)
+
+    app_base_url = os.environ.get("APP_BASE_URL", "").rstrip("/")
+    redirect_uri = f"{app_base_url}/api/playlist/setup/callback"
+
+    from svc import spotify as _sp
+    login_url = _sp.generate_login_url(x_user_email or "", redirect_uri)
+    if login_url is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "SPOTIFY_CLIENT_ID o SPOTIFY_CLIENT_SECRET no configurados. "
+                "Define las variables de entorno antes de usar el setup."
+            ),
+        )
+    return {"login_url": login_url}
+
+
+@app.post("/playlist/setup/exchange")
+async def playlist_setup_exchange(
+    body: _SetupExchangeBody,
+    x_internal_token: str | None = Header(default=None),
+):
+    """Intercambia el code OAuth por tokens y guarda el refresh_token central.
+
+    El state HMAC incluye el email del admin:
+      - Si la firma no es válida → 400 invalid_state.
+      - Si el email no es admin → 403.
+      - Si el ID de usuario no coincide con SPOTIFY_CENTRAL_EXPECTED_USER_ID → 400.
+
+    No requiere X-User-Email: la identidad del admin está en el state firmado.
+    """
+    _check_token(x_internal_token)
+
+    from svc import spotify as _sp
+    result = _sp.exchange_code(body.code, body.state, body.redirect_uri)
+
+    if result.get("error") == "invalid_state":
+        raise HTTPException(status_code=400, detail="State OAuth inválido o caducado.")
+    if result.get("error") == "not_admin":
+        raise HTTPException(status_code=403, detail="El email del state no tiene permisos de admin.")
+    if result.get("error") == "not_configured":
+        raise HTTPException(status_code=503, detail="Spotify CLIENT_ID/SECRET no configurados.")
+    if result.get("error") == "expected_user_id_not_configured":
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "SPOTIFY_CENTRAL_EXPECTED_USER_ID no está configurado en el servidor. "
+                "Es obligatorio para el setup (fail-closed). "
+                "Añade la variable de entorno antes de continuar."
+            ),
+        )
+    if result.get("error") == "account_mismatch":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "La cuenta autorizada no coincide con SPOTIFY_CENTRAL_EXPECTED_USER_ID. "
+                "Verifica que estás conectando la cuenta correcta."
+            ),
+        )
+    if result.get("error"):
+        raise HTTPException(status_code=502, detail=f"Error en el intercambio OAuth: {result['error']}")
+
+    return result
+
+
+@app.post("/playlist/setup/disconnect")
+async def playlist_setup_disconnect(
+    x_internal_token: str | None = Header(default=None),
+    x_user_email:     str | None = Header(default=None),
+):
+    """Elimina el token central y limpia la caché de acceso.
+
+    Solo accesible por admins.
+    """
+    _check_token(x_internal_token)
+    _check_admin(x_user_email)
+
+    from svc import spotify as _sp
+    _sp.delete_central_token()
+    return {"ok": True}
+
+
+# ── Spotify job endpoints ──────────────────────────────────────────────────────
+
+@app.post("/playlist", status_code=202)
+async def crear_playlist(
+    body: _PlaylistJobBody,
+    x_internal_token: str | None = Header(default=None),
+):
+    """Crea un job de creación de playlist Spotify y lo arranca en background.
+
+    Fail-closed: si no hay cuenta central configurada → 401 not_configured.
+    Valida que isrcs no esté vacío y name no esté vacío → 422.
+
+    Devuelve 202 con {job_id, total}.
+    """
+    _check_token(x_internal_token)
+
+    from svc import spotify as _sp
+    from svc import spotify_jobs
+
+    # Verificar cuenta central configurada
+    if not _sp.has_central_token():
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error":   "not_configured",
+                "message": (
+                    "No hay cuenta Spotify central configurada. "
+                    "El admin debe conectar una cuenta en /playlist/setup."
+                ),
+            },
+        )
+
+    # Verificar límite de cola (evitar abuso y OOM)
+    active = spotify_jobs.count_active_jobs()
+    if active >= _SP_MAX_QUEUED:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Cola llena: hay {active} job(s) en curso. "
+                f"Máximo {_SP_MAX_QUEUED} simultáneos. "
+                "Espera a que alguno termine antes de crear otro."
+            ),
+        )
+
+    # Validar y normalizar ISRCs
+    isrcs = [i.strip().upper() for i in (body.isrcs or []) if i.strip()]
+    valid_isrcs = [i for i in isrcs if _ISRC_RE.match(i)]
+
+    if not valid_isrcs:
+        raise HTTPException(
+            status_code=422,
+            detail="El listado de ISRCs está vacío o no contiene ISRCs válidos.",
+        )
+
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(
+            status_code=422,
+            detail="El nombre de la playlist no puede estar vacío.",
+        )
+
+    job_id = spotify_jobs.create_job(
+        valid_isrcs,
+        name,
+        (body.description or "").strip(),
+        bool(body.public),
+    )
+    spotify_jobs.start_job(job_id)
+
+    logger.info(
+        "svc: Spotify playlist job creado job_id=%s, total=%d ISRCs.",
+        job_id, len(valid_isrcs),
+    )
+    return {"job_id": job_id, "total": len(valid_isrcs)}
+
+
+@app.get("/playlist/{job_id}/status")
+async def get_playlist_status(
+    job_id: str,
+    x_internal_token: str | None = Header(default=None),
+):
+    """Estado actual del job de playlist.
+
+    Calcula el estado efectivo: si el job está en 'running' y cooldown_until
+    es futuro, expone estado 'cooldown' para que el frontend haga polling lento.
+
+    Contrato:
+      {estado, phase, resolved, total, added, not_found, progress_pct,
+       status_text, cooldown_until, error_msg}
+    """
+    _validate_job_id(job_id)
+    _check_token(x_internal_token)
+
+    from svc import spotify_jobs
+
+    status = spotify_jobs.get_status(job_id)
+    if not status:
+        raise HTTPException(status_code=404, detail="Job no encontrado.")
+
+    # Calcular estado efectivo: 'cooldown' si hay penalty-box activo
+    effective_estado  = status["estado"]
+    cooldown_until    = status["cooldown_until"]
+    if effective_estado == "running" and cooldown_until:
+        try:
+            cd = datetime.fromisoformat(cooldown_until)
+            if cd > datetime.now(timezone.utc):
+                effective_estado = "cooldown"
+        except Exception:
+            pass
+
+    return {
+        "estado":         effective_estado,
+        "phase":          status["phase"],
+        "resolved":       status["resolved"],
+        "total":          status["total"],
+        "added":          status["added"],
+        "not_found":      status["not_found_count"],
+        "progress_pct":   status["progress_pct"],
+        "status_text":    status["status_text"],
+        "cooldown_until": cooldown_until,
+        "error_msg":      status["error_msg"],
+    }
+
+
+@app.get("/playlist/{job_id}/result.json")
+async def get_playlist_result_json(
+    job_id: str,
+    x_internal_token: str | None = Header(default=None),
+):
+    """Resultado JSON de la playlist creada.
+
+    Disponible cuando estado ∈ {done, cancelled, error}.
+    Devuelve: {playlist_url, playlist_name, tracks_added, not_found_isrcs,
+               total_isrcs, errors_count}
+      - errors_count: ISRCs que no se pudieron resolver + lotes de add que fallaron.
+    """
+    _validate_job_id(job_id)
+    _check_token(x_internal_token)
+
+    from svc import spotify_jobs
+
+    path = spotify_jobs.get_result_path(job_id)
+    if path is None:
+        status = spotify_jobs.get_status(job_id)
+        if not status:
+            raise HTTPException(status_code=404, detail="Job no encontrado.")
+        if status["estado"] in ("running", "pending"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Resultado no disponible aún (estado: {status['estado']}).",
+            )
+        # Job terminal pero sin fichero (cancelado antes de materializarse): devolver vacío
+        return JSONResponse({
+            "playlist_url":    "",
+            "playlist_name":   "",
+            "tracks_added":    0,
+            "not_found_isrcs": [],
+            "total_isrcs":     status.get("total", 0),
+            "errors_count":    0,
+        })
+    return FileResponse(
+        path=str(path),
+        media_type="application/json",
+        filename=f"playlist_{job_id}.json",
+    )
+
+
+@app.get("/playlist/{job_id}/result/not_found.csv")
+async def get_playlist_result_not_found_csv(
+    job_id: str,
+    x_internal_token: str | None = Header(default=None),
+):
+    """CSV con los ISRCs no encontrados en Spotify.
+
+    Columna: ISRC (una por fila).
+    Disponible cuando estado ∈ {done, cancelled, error}.
+    """
+    _validate_job_id(job_id)
+    _check_token(x_internal_token)
+
+    from svc import spotify_jobs
+
+    path = spotify_jobs.get_not_found_csv_path(job_id)
+    if path is None:
+        status = spotify_jobs.get_status(job_id)
+        if not status:
+            raise HTTPException(status_code=404, detail="Job no encontrado.")
+        if status["estado"] in ("running", "pending"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Resultado no disponible aún (estado: {status['estado']}).",
+            )
+        # Job terminal pero sin fichero (cancelado antes de materializarse): CSV vacío
+        from fastapi.responses import Response as _Response
+        return _Response(
+            content="ISRC\n",
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": f'attachment; filename="isrcs_no_encontrados_{job_id}.csv"',
+            },
+        )
+    return FileResponse(
+        path=str(path),
+        media_type="text/csv",
+        filename=f"isrcs_no_encontrados_{job_id}.csv",
+    )
+
+
+@app.post("/playlist/{job_id}/cancel")
+async def cancel_playlist(
+    job_id: str,
+    x_internal_token: str | None = Header(default=None),
+):
+    """Cancela un job de playlist en curso.
+
+    El worker para limpiamente al final de la operación en curso (rate-limit slot,
+    lote de tracks, o cooldown interruptible).
+    """
+    _validate_job_id(job_id)
+    _check_token(x_internal_token)
+
+    from svc import spotify_jobs
+
+    ok = spotify_jobs.cancel_job(job_id)
+    if not ok:
+        status = spotify_jobs.get_status(job_id)
+        if not status:
+            raise HTTPException(status_code=404, detail="Job no encontrado.")
+        raise HTTPException(
+            status_code=409,
+            detail=f"El job no se puede cancelar (estado: {status['estado']}).",
+        )
+    return {"ok": True, "job_id": job_id}
